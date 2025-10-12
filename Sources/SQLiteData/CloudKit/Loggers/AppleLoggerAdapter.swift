@@ -256,6 +256,26 @@
     public func debug(_ message: String) {
       logger.debug("\(message)")
     }
+
+    public func info(_ message: String) {
+      logger.info("\(message)")
+    }
+
+    public func notice(_ message: String) {
+      logger.notice("\(message)")
+    }
+
+    public func warning(_ message: String) {
+      logger.warning("\(message)")
+    }
+
+    public func error(_ message: String) {
+      logger.error("\(message)")
+    }
+
+    public func fault(_ message: String) {
+      logger.fault("\(message)")
+    }
   }
 
   extension CKError.Code {

@@ -37,5 +37,35 @@
         logger.debug(message)
       }
     }
+
+    public func info(_ message: String) {
+      for logger in loggers {
+        logger.info(message)
+      }
+    }
+
+    public func notice(_ message: String) {
+      for logger in loggers {
+        logger.notice(message)
+      }
+    }
+
+    public func warning(_ message: String) {
+      for logger in loggers {
+        logger.warning(message)
+      }
+    }
+
+    public func error(_ message: String) {
+      for logger in loggers {
+        logger.error(message)
+      }
+    }
+
+    public func fault(_ message: String) {
+      for logger in loggers {
+        logger.fault(message)
+      }
+    }
   }
 #endif

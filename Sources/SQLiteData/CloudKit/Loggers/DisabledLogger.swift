@@ -17,5 +17,25 @@
     public func debug(_ message: String) {
       // No-op: logging is disabled
     }
+
+    public func info(_ message: String) {
+      // No-op: logging is disabled
+    }
+
+    public func notice(_ message: String) {
+      // No-op: logging is disabled
+    }
+
+    public func warning(_ message: String) {
+      // No-op: logging is disabled
+    }
+
+    public func error(_ message: String) {
+      // No-op: logging is disabled
+    }
+
+    public func fault(_ message: String) {
+      // No-op: logging is disabled
+    }
   }
 #endif

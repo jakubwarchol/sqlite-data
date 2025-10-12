@@ -471,17 +471,22 @@
       )
       return Task {
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          guard try await container.accountStatus() == .available
-          else { return }
-          try await uploadRecordsToCloudKit(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await updateLocalFromSchemaChange(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await cacheUserTables(recordTypes: currentRecordTypes)
+          do {
+            guard try await container.accountStatus() == .available
+            else { return }
+            try await uploadRecordsToCloudKit(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await updateLocalFromSchemaChange(
+              previousRecordTypeByTableName: previousRecordTypeByTableName,
+              currentRecordTypeByTableName: currentRecordTypeByTableName
+            )
+            try await cacheUserTables(recordTypes: currentRecordTypes)
+          } catch {
+            logger.error("Failed to start sync engine")
+            throw error
+          }
         }
       }
     }
@@ -623,16 +628,26 @@
       stop()
       try tearDownSyncEngine()
       await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          for table in tables {
-            func open<T>(_: some SynchronizableTable<T>) {
-              withErrorReporting(.sqliteDataCloudKitFailure) {
-                try T.delete().execute(db)
+        do {
+          try await userDatabase.write { db in
+            for table in tables {
+              func open<T>(_: some SynchronizableTable<T>) {
+                withErrorReporting(.sqliteDataCloudKitFailure) {
+                  do {
+                    try T.delete().execute(db)
+                  } catch {
+                    logger.error("Failed to delete table data")
+                    throw error
+                  }
+                }
               }
+              open(table)
             }
-            open(table)
+            try setUpSyncEngine(writableDB: db)
           }
-          try setUpSyncEngine(writableDB: db)
+        } catch {
+          logger.error("Failed to delete local data")
+          throw error
         }
       }
       try await start()
@@ -686,14 +701,19 @@
         // TODO: Perform this work in a trigger instead of a task.
         Task { [changes = oldChanges + newChanges] in
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert {
-                  for change in changes {
-                    PendingRecordZoneChange(change)
+            do {
+              try await userDatabase.write { db in
+                try PendingRecordZoneChange
+                  .insert {
+                    for change in changes {
+                      PendingRecordZoneChange(change)
+                    }
                   }
-                }
-                .execute(db)
+                  .execute(db)
+              }
+            } catch {
+              logger.warning("Failed to persist pending record zone changes while engine stopped")
+              throw error
             }
           }
         }
@@ -730,10 +750,15 @@
       guard isRunning else {
         Task { [changes] in
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try PendingRecordZoneChange
-                .insert { changes.map { PendingRecordZoneChange($0) } }
-                .execute(db)
+            do {
+              try await userDatabase.write { db in
+                try PendingRecordZoneChange
+                  .insert { changes.map { PendingRecordZoneChange($0) } }
+                  .execute(db)
+              }
+            } catch {
+              logger.warning("Failed to persist pending delete changes while engine stopped")
+              throw error
             }
           }
         }
@@ -750,6 +775,7 @@
       guard let rootRecordID = metadata.hierarchicalRootRecordID
       else {
         reportIssue("Attempting to share without root record information.")
+        logger.error("Attempting to share without root record information.")
         return
       }
       let container = type(of: container).createContainer(identifier: metadata.containerIdentifier)
@@ -827,6 +853,7 @@
       guard let event = Event(event)
       else {
         reportIssue("Unrecognized event received: \(event)")
+        logger.error("Unrecognized event received: \(event)")
         return
       }
       await handleEvent(event, syncEngine: syncEngine)
@@ -1005,12 +1032,17 @@
         func open<T>(_: some SynchronizableTable<T>) async -> CKRecord? {
           let row =
             withErrorReporting(.sqliteDataCloudKitFailure) {
-              try userDatabase.read { db in
-                try T
-                  .where {
-                    #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)")
-                  }
-                  .fetchOne(db)
+              do {
+                return try userDatabase.read { db in
+                  try T
+                    .where {
+                      #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)")
+                    }
+                    .fetchOne(db)
+                }
+              } catch {
+                logger.error("Failed to read row for creating CKRecord")
+                throw error
               }
             }
             ?? nil
@@ -1077,52 +1109,57 @@
       let (sharesToDelete, recordsWithRoot):
         ([CKShare?], [(lastKnownServerRecord: CKRecord?, rootLastKnownServerRecord: CKRecord?)]) =
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            guard !deletedRecordIDs.isEmpty
-            else { return ([], []) }
+            do {
+              guard !deletedRecordIDs.isEmpty
+              else { return ([], []) }
 
-            return try await metadatabase.read { db in
-              let sharesToDelete =
-                try SyncMetadata
-                .findAll(deletedRecordIDs)
-                .where(\.isShared)
-                .select(\.share)
-                .fetchAll(db)
+              return try await metadatabase.read { db in
+                let sharesToDelete =
+                  try SyncMetadata
+                  .findAll(deletedRecordIDs)
+                  .where(\.isShared)
+                  .select(\.share)
+                  .fetchAll(db)
 
-              let recordsWithRoot =
-                try With {
-                  SyncMetadata
-                    .findAll(deletedRecordIDs)
-                    .where { $0.parentRecordName.is(nil) }
-                    .select {
-                      RecordWithRoot.Columns(
-                        parentRecordName: $0.parentRecordName,
-                        recordName: $0.recordName,
-                        lastKnownServerRecord: $0.lastKnownServerRecord,
-                        rootRecordName: $0.recordName,
-                        rootLastKnownServerRecord: $0.lastKnownServerRecord
+                let recordsWithRoot =
+                  try With {
+                    SyncMetadata
+                      .findAll(deletedRecordIDs)
+                      .where { $0.parentRecordName.is(nil) }
+                      .select {
+                        RecordWithRoot.Columns(
+                          parentRecordName: $0.parentRecordName,
+                          recordName: $0.recordName,
+                          lastKnownServerRecord: $0.lastKnownServerRecord,
+                          rootRecordName: $0.recordName,
+                          rootLastKnownServerRecord: $0.lastKnownServerRecord
+                        )
+                      }
+                      .union(
+                        all: true,
+                        SyncMetadata
+                          .join(RecordWithRoot.all) { $1.recordName.is($0.parentRecordName) }
+                          .select { metadata, tree in
+                            RecordWithRoot.Columns(
+                              parentRecordName: metadata.parentRecordName,
+                              recordName: metadata.recordName,
+                              lastKnownServerRecord: metadata.lastKnownServerRecord,
+                              rootRecordName: tree.rootRecordName,
+                              rootLastKnownServerRecord: tree.lastKnownServerRecord
+                            )
+                          }
                       )
-                    }
-                    .union(
-                      all: true,
-                      SyncMetadata
-                        .join(RecordWithRoot.all) { $1.recordName.is($0.parentRecordName) }
-                        .select { metadata, tree in
-                          RecordWithRoot.Columns(
-                            parentRecordName: metadata.parentRecordName,
-                            recordName: metadata.recordName,
-                            lastKnownServerRecord: metadata.lastKnownServerRecord,
-                            rootRecordName: tree.rootRecordName,
-                            rootLastKnownServerRecord: tree.lastKnownServerRecord
-                          )
-                        }
-                    )
-                } query: {
-                  RecordWithRoot
-                    .select { ($0.lastKnownServerRecord, $0.rootLastKnownServerRecord) }
-                }
-                .fetchAll(db)
+                  } query: {
+                    RecordWithRoot
+                      .select { ($0.lastKnownServerRecord, $0.rootLastKnownServerRecord) }
+                  }
+                  .fetchAll(db)
 
-              return (sharesToDelete, recordsWithRoot)
+                return (sharesToDelete, recordsWithRoot)
+              }
+            } catch {
+              logger.error("Failed to read shares and records for deletion")
+              throw error
             }
           }
           ?? ([], [])
@@ -1145,13 +1182,18 @@
       }
 
       await withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard !deletedRecordIDs.isEmpty
-        else { return }
-        try await userDatabase.write { db in
-          try SyncMetadata
-            .findAll(deletedRecordIDs)
-            .delete()
-            .execute(db)
+        do {
+          guard !deletedRecordIDs.isEmpty
+          else { return }
+          try await userDatabase.write { db in
+            try SyncMetadata
+              .findAll(deletedRecordIDs)
+              .delete()
+              .execute(db)
+          }
+        } catch {
+          logger.error("Failed to delete metadata for deleted records")
+          throw error
         }
       }
 
@@ -1169,11 +1211,21 @@
       case .signIn:
         syncEngine.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
         await withErrorReporting {
-          try await enqueueUnknownRecordsForCloudKit()
+          do {
+            try await enqueueUnknownRecordsForCloudKit()
+          } catch {
+            logger.warning("Failed to enqueue unknown records for CloudKit on sign in")
+            throw error
+          }
         }
       case .signOut, .switchAccounts:
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await deleteLocalData()
+          do {
+            try await deleteLocalData()
+          } catch {
+            logger.error("Failed to delete local data on account change")
+            throw error
+          }
         }
       @unknown default:
         break
@@ -1185,14 +1237,19 @@
       syncEngine: any SyncEngineProtocol
     ) async {
       await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          try StateSerialization.upsert {
-            StateSerialization.Draft(
-              scope: syncEngine.database.databaseScope,
-              data: stateSerialization
-            )
+        do {
+          try await userDatabase.write { db in
+            try StateSerialization.upsert {
+              StateSerialization.Draft(
+                scope: syncEngine.database.databaseScope,
+                data: stateSerialization
+              )
+            }
+            .execute(db)
           }
-          .execute(db)
+        } catch {
+          logger.error("Failed to save state serialization")
+          throw error
         }
       }
     }
@@ -1204,22 +1261,28 @@
     ) async {
       let defaultZoneDeleted =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await userDatabase.write { db in
-            var defaultZoneDeleted = false
-            for (zoneID, reason) in deletions {
-              switch reason {
-              case .deleted, .purged:
-                try deleteRecords(in: zoneID, db: db)
-                if zoneID == self.defaultZone.zoneID {
-                  defaultZoneDeleted = true
+          do {
+            return try await userDatabase.write { db in
+              var defaultZoneDeleted = false
+              for (zoneID, reason) in deletions {
+                switch reason {
+                case .deleted, .purged:
+                  try deleteRecords(in: zoneID, db: db)
+                  if zoneID == self.defaultZone.zoneID {
+                    defaultZoneDeleted = true
+                  }
+                case .encryptedDataReset:
+                  try uploadRecords(in: zoneID, db: db)
+                @unknown default:
+                  reportIssue("Unknown deletion reason: \(reason)")
+                  logger.warning("Unknown deletion reason: \(reason)")
                 }
-              case .encryptedDataReset:
-                try uploadRecords(in: zoneID, db: db)
-              @unknown default:
-                reportIssue("Unknown deletion reason: \(reason)")
               }
+              return defaultZoneDeleted
             }
-            return defaultZoneDeleted
+          } catch {
+            logger.error("Failed to handle fetched database changes")
+            throw error
           }
         }
         ?? false
@@ -1244,7 +1307,12 @@
           else { continue }
           func open<T: PrimaryKeyedTable>(_: some SynchronizableTable<T>) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
-              try T.where { #sql("\($0.primaryKey)").in(primaryKeys) }.delete().execute(db)
+              do {
+                try T.where { #sql("\($0.primaryKey)").in(primaryKeys) }.delete().execute(db)
+              } catch {
+                logger.error("Failed to delete records from zone")
+                throw error
+              }
             }
           }
           open(table)
@@ -1265,11 +1333,16 @@
           else { continue }
           func open<T>(_: some SynchronizableTable<T>) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
-              pendingRecordZoneChanges.append(
-                contentsOf: try T.select(\._recordName).fetchAll(db).map {
-                  .saveRecord(CKRecord.ID(recordName: $0, zoneID: zoneID))
-                }
-              )
+              do {
+                pendingRecordZoneChanges.append(
+                  contentsOf: try T.select(\._recordName).fetchAll(db).map {
+                    .saveRecord(CKRecord.ID(recordName: $0, zoneID: zoneID))
+                  }
+                )
+              } catch {
+                logger.error("Failed to enqueue records for upload")
+                throw error
+              }
             }
           }
           open(table)
@@ -1298,21 +1371,26 @@
         if let table = tablesByName[recordType] {
           func open<T>(_: some SynchronizableTable<T>) async {
             await withErrorReporting(.sqliteDataCloudKitFailure) {
-              try await userDatabase.write { db in
-                try T
-                  .where {
-                    #sql("\($0.primaryKey)").in(
-                      SyncMetadata.findAll(recordIDs)
-                        .select(\.recordPrimaryKey)
-                    )
-                  }
-                  .delete()
-                  .execute(db)
+              do {
+                try await userDatabase.write { db in
+                  try T
+                    .where {
+                      #sql("\($0.primaryKey)").in(
+                        SyncMetadata.findAll(recordIDs)
+                          .select(\.recordPrimaryKey)
+                      )
+                    }
+                    .delete()
+                    .execute(db)
 
-                try UnsyncedRecordID
-                  .findAll(recordIDs)
-                  .delete()
-                  .execute(db)
+                  try UnsyncedRecordID
+                    .findAll(recordIDs)
+                    .delete()
+                    .execute(db)
+                }
+              } catch {
+                logger.error("Failed to delete records from fetched zone changes")
+                throw error
               }
             }
           }
@@ -1320,17 +1398,27 @@
         } else if recordType == CKRecord.SystemType.share {
           for shareRecordID in recordIDs {
             await withErrorReporting(.sqliteDataCloudKitFailure) {
-              try await deleteShare(shareRecordID: shareRecordID)
+              do {
+                try await deleteShare(shareRecordID: shareRecordID)
+              } catch {
+                logger.error("Failed to delete share")
+                throw error
+              }
             }
           }
         } else {
           // NB: Deleting a record from a table we do not currently recognize.
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try SyncMetadata
-                .findAll(recordIDs)
-                .delete()
-                .execute(db)
+            do {
+              try await userDatabase.write { db in
+                try SyncMetadata
+                  .findAll(recordIDs)
+                  .delete()
+                  .execute(db)
+              }
+            } catch {
+              logger.warning("Failed to delete unrecognized record metadata")
+              throw error
             }
           }
         }
@@ -1338,39 +1426,44 @@
 
       let unsyncedRecords =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          var unsyncedRecordIDs = try await userDatabase.write { db in
-            Set(
-              try UnsyncedRecordID.all
-                .fetchAll(db)
-                .map(CKRecord.ID.init(unsyncedRecordID:))
-            )
-          }
-          let modificationRecordIDs = Set(modifications.map(\.recordID))
-          let unsyncedRecordIDsToDelete = modificationRecordIDs.intersection(unsyncedRecordIDs)
-          unsyncedRecordIDs.subtract(modificationRecordIDs)
-          if !unsyncedRecordIDsToDelete.isEmpty {
-            try await userDatabase.write { db in
-              try UnsyncedRecordID
-                .findAll(unsyncedRecordIDsToDelete)
-                .delete()
-                .execute(db)
+          do {
+            var unsyncedRecordIDs = try await userDatabase.write { db in
+              Set(
+                try UnsyncedRecordID.all
+                  .fetchAll(db)
+                  .map(CKRecord.ID.init(unsyncedRecordID:))
+              )
             }
-          }
-          let results = try await syncEngine.database.records(for: Array(unsyncedRecordIDs))
-          var unsyncedRecords: [CKRecord] = []
-          for (recordID, result) in results {
-            switch result {
-            case .success(let record):
-              unsyncedRecords.append(record)
-            case .failure(let error as CKError) where error.code == .unknownItem:
+            let modificationRecordIDs = Set(modifications.map(\.recordID))
+            let unsyncedRecordIDsToDelete = modificationRecordIDs.intersection(unsyncedRecordIDs)
+            unsyncedRecordIDs.subtract(modificationRecordIDs)
+            if !unsyncedRecordIDsToDelete.isEmpty {
               try await userDatabase.write { db in
-                try UnsyncedRecordID.find(recordID).delete().execute(db)
+                try UnsyncedRecordID
+                  .findAll(unsyncedRecordIDsToDelete)
+                  .delete()
+                  .execute(db)
               }
-            case .failure:
-              continue
             }
+            let results = try await syncEngine.database.records(for: Array(unsyncedRecordIDs))
+            var unsyncedRecords: [CKRecord] = []
+            for (recordID, result) in results {
+              switch result {
+              case .success(let record):
+                unsyncedRecords.append(record)
+              case .failure(let error as CKError) where error.code == .unknownItem:
+                try await userDatabase.write { db in
+                  try UnsyncedRecordID.find(recordID).delete().execute(db)
+                }
+              case .failure:
+                continue
+              }
+            }
+            return unsyncedRecords
+          } catch {
+            logger.warning("Failed to fetch unsynced records")
+            throw error
           }
-          return unsyncedRecords
         }
         ?? [CKRecord]()
 
@@ -1390,19 +1483,24 @@
       }
       let shares: [ShareOrReference] =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await userDatabase.write { db in
-            var shares: [ShareOrReference] = []
-            for record in modifications {
-              if let share = record as? CKShare {
-                shares.append(.share(share))
-              } else {
-                upsertFromServerRecord(record, db: db)
-                if let shareReference = record.share {
-                  shares.append(.reference(shareReference))
+          do {
+            return try await userDatabase.write { db in
+              var shares: [ShareOrReference] = []
+              for record in modifications {
+                if let share = record as? CKShare {
+                  shares.append(.share(share))
+                } else {
+                  upsertFromServerRecord(record, db: db)
+                  if let shareReference = record.share {
+                    shares.append(.reference(shareReference))
+                  }
                 }
               }
+              return shares
             }
-            return shares
+          } catch {
+            logger.error("Failed to process shares and records")
+            throw error
           }
         }
         ?? []
@@ -1413,7 +1511,12 @@
             switch share {
             case .share(let share):
               await withErrorReporting(.sqliteDataCloudKitFailure) {
-                try await self.cacheShare(share)
+                do {
+                  try await self.cacheShare(share)
+                } catch {
+                  self.logger.warning("Failed to cache share")
+                  throw error
+                }
               }
             case .reference(let shareReference):
               guard
@@ -1421,7 +1524,12 @@
                 let share = record as? CKShare
               else { return }
               await withErrorReporting(.sqliteDataCloudKitFailure) {
-                try await self.cacheShare(share)
+                do {
+                  try await self.cacheShare(share)
+                } catch {
+                  self.logger.warning("Failed to cache share from reference")
+                  throw error
+                }
               }
             }
           }
@@ -1449,11 +1557,16 @@
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await userDatabase.write { db in
-              try SyncMetadata
-                .find(failedRecord.recordID)
-                .update { $0.setLastKnownServerRecord(nil) }
-                .execute(db)
+            do {
+              try await userDatabase.write { db in
+                try SyncMetadata
+                  .find(failedRecord.recordID)
+                  .update { $0.setLastKnownServerRecord(nil) }
+                  .execute(db)
+              }
+            } catch {
+              logger.error("Failed to clear server record after save failure")
+              throw error
             }
           }
         }
@@ -1534,7 +1647,12 @@
             }
           }
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await open(table)
+            do {
+              try await open(table)
+            } catch {
+              logger.error("Failed to handle reference violation")
+              throw error
+            }
           }
 
         case .permissionFailure:
@@ -1558,7 +1676,12 @@
             }
           }
           await withErrorReporting(.sqliteDataCloudKitFailure) {
-            try await open(table)
+            do {
+              try await open(table)
+            } catch {
+              logger.error("Failed to handle permission failure")
+              throw error
+            }
           }
 
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
@@ -1581,20 +1704,25 @@
 
       let enqueuedUnsyncedRecordID =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await userDatabase.write { db in
-            var enqueuedUnsyncedRecordID = false
-            for (failedRecordID, error) in failedRecordDeletes {
-              guard
-                error.code == .referenceViolation
-              else { continue }
-              try UnsyncedRecordID.insert(or: .ignore) {
-                UnsyncedRecordID(recordID: failedRecordID)
+          do {
+            return try await userDatabase.write { db in
+              var enqueuedUnsyncedRecordID = false
+              for (failedRecordID, error) in failedRecordDeletes {
+                guard
+                  error.code == .referenceViolation
+                else { continue }
+                try UnsyncedRecordID.insert(or: .ignore) {
+                  UnsyncedRecordID(recordID: failedRecordID)
+                }
+                .execute(db)
+                syncEngine.state.remove(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
+                enqueuedUnsyncedRecordID = true
               }
-              .execute(db)
-              syncEngine.state.remove(pendingRecordZoneChanges: [.deleteRecord(failedRecordID)])
-              enqueuedUnsyncedRecordID = true
+              return enqueuedUnsyncedRecordID
             }
-            return enqueuedUnsyncedRecordID
+          } catch {
+            logger.warning("Failed to enqueue unsynced record for delete failure")
+            throw error
           }
         }
         ?? false
@@ -1642,8 +1770,13 @@
       force: Bool = false
     ) async {
       await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          upsertFromServerRecord(serverRecord, force: force, db: db)
+        do {
+          try await userDatabase.write { db in
+            upsertFromServerRecord(serverRecord, force: force, db: db)
+          }
+        } catch {
+          logger.error("Failed to upsert record from server")
+          throw error
         }
       }
     }
@@ -1654,10 +1787,11 @@
       db: Database
     ) {
       withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey
-        else { return }
+        do {
+          guard let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey
+          else { return }
 
-        try SyncMetadata.insert {
+          try SyncMetadata.insert {
           SyncMetadata(
             recordPrimaryKey: recordPrimaryKey,
             recordType: serverRecord.recordType,
@@ -1731,12 +1865,17 @@
           }
         }
         try open(table)
+        } catch {
+          logger.error("Failed to upsert record from server to database")
+          throw error
+        }
       }
     }
 
     private func refreshLastKnownServerRecord(_ record: CKRecord) async {
       await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await metadatabase.write { db in
+        do {
+          try await metadatabase.write { db in
           let metadata = try SyncMetadata.find(record.recordID).fetchOne(db)
           func updateLastKnownServerRecord() throws {
             try SyncMetadata
@@ -1752,6 +1891,10 @@
           } else {
             try updateLastKnownServerRecord()
           }
+        }
+        } catch {
+          logger.error("Failed to refresh last known server record")
+          throw error
         }
       }
     }
@@ -1788,6 +1931,7 @@
               let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
               if data == nil {
                 reportIssue("Asset data not found on disk")
+                logger.warning("Asset data not found on disk")
               }
               return data?.queryFragment ?? "NULL"
             } else {
@@ -1805,6 +1949,7 @@
               let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
               if data == nil {
                 reportIssue("Asset data not found on disk")
+                logger.warning("Asset data not found on disk")
               }
               return "\(quote: columnName) = \(data?.queryFragment ?? "NULL")"
             } else {
