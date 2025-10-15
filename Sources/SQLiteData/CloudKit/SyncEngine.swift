@@ -2409,49 +2409,47 @@
     var fetchingChangesCount = 0
   }
 
-  #if DEBUG
-    extension CKDatabase.Scope {
-      var label: String {
-        switch self {
-        case .public: "global"
-        case .private: "private"
-        case .shared: "shared"
-        @unknown default: "unknown"
-        }
+  extension CKDatabase.Scope {
+    var label: String {
+      switch self {
+      case .public: "global"
+      case .private: "private"
+      case .shared: "shared"
+      @unknown default: "unknown"
       }
     }
+  }
 
-    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-    private struct NextRecordZoneChangeBatchLoggingState {
-      var events: [String] = []
-      var recordTypes: [String] = []
-      var recordNames: [String] = []
-      var tabularDescription: String? {
-        guard !events.isEmpty
-        else { return nil }
-        var dataFrame: DataFrame = [
-          "event": events,
-          "recordType": recordTypes,
-          "recordName": recordNames,
-        ]
-        dataFrame.sort(
-          on: ColumnID("event", String.self),
-          ColumnID("recordType", String.self),
-          ColumnID("recordName", String.self)
-        )
-        var formattingOptions = FormattingOptions(
-          maximumLineWidth: 120,
-          maximumCellWidth: 80,
-          maximumRowCount: 50,
-          includesColumnTypes: false
-        )
-        formattingOptions.includesRowAndColumnCounts = false
-        formattingOptions.includesRowIndices = false
-        return
-          dataFrame
-          .description(options: formattingOptions)
-          .replacing("\n", with: "\n  ")
-      }
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private struct NextRecordZoneChangeBatchLoggingState {
+    var events: [String] = []
+    var recordTypes: [String] = []
+    var recordNames: [String] = []
+    var tabularDescription: String? {
+      guard !events.isEmpty
+      else { return nil }
+      var dataFrame: DataFrame = [
+        "event": events,
+        "recordType": recordTypes,
+        "recordName": recordNames,
+      ]
+      dataFrame.sort(
+        on: ColumnID("event", String.self),
+        ColumnID("recordType", String.self),
+        ColumnID("recordName", String.self)
+      )
+      var formattingOptions = FormattingOptions(
+        maximumLineWidth: 120,
+        maximumCellWidth: 80,
+        maximumRowCount: 50,
+        includesColumnTypes: false
+      )
+      formattingOptions.includesRowAndColumnCounts = false
+      formattingOptions.includesRowIndices = false
+      return
+        dataFrame
+        .description(options: formattingOptions)
+        .replacing("\n", with: "\n  ")
     }
-  #endif
+  }
 #endif
