@@ -19,6 +19,7 @@
   public final class SyncEngine: Observable, Sendable {
     package let userDatabase: UserDatabase
     package let logger: any SyncEngineLogger
+    package let logEvents: Bool
     package let metadatabase: any DatabaseWriter
     package let tables: [any SynchronizableTable]
     package let privateTables: [any SynchronizableTable]
@@ -74,6 +75,9 @@
     ///   explicit call to ``start()``. By default this argument is `true`.
     ///   - logger: The logger used to log events in the sync engine. By default a disabled
     ///   logger is used, which means logs are not printed.
+    ///   - logEvents: Controls whether sync events are logged. When `true`, detailed sync events
+    ///   (like willSync, didSync, fetchedRecordZoneChanges, etc.) are sent to the logger.
+    ///   Defaults to `true` for DEBUG builds, `false` for RELEASE builds.
     public convenience init<
       each T1: PrimaryKeyedTable & _SendableMetatype,
       each T2: PrimaryKeyedTable & _SendableMetatype
@@ -85,7 +89,14 @@
       defaultZone: CKRecordZone = CKRecordZone(zoneName: "co.pointfree.SQLiteData.defaultZone"),
       startImmediately: Bool = DependencyValues._current.context == .live,
       logger: any SyncEngineLogger = isTesting
-        ? DisabledLogger() : AppleLoggerAdapter(subsystem: "SQLiteData", category: "CloudKit")
+        ? DisabledLogger() : AppleLoggerAdapter(subsystem: "SQLiteData", category: "CloudKit"),
+      logEvents: Bool = {
+        #if DEBUG
+          return true
+        #else
+          return false
+        #endif
+      }()
     ) throws
     where
       repeat (each T1).PrimaryKey.QueryOutput: IdentifierStringConvertible,
@@ -135,6 +146,7 @@
           },
           userDatabase: userDatabase,
           logger: logger,
+          logEvents: logEvents,
           tables: allTables,
           privateTables: allPrivateTables
         )
@@ -183,6 +195,7 @@
         },
         userDatabase: userDatabase,
         logger: logger,
+        logEvents: logEvents,
         tables: allTables,
         privateTables: allPrivateTables
       )
@@ -202,6 +215,13 @@
         ) -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol),
       userDatabase: UserDatabase,
       logger: any SyncEngineLogger,
+      logEvents: Bool = {
+        #if DEBUG
+          return true
+        #else
+          return false
+        #endif
+      }(),
       tables: [any SynchronizableTable],
       privateTables: [any SynchronizableTable] = []
     ) throws {
@@ -242,6 +262,7 @@
       self.defaultSyncEngines = defaultSyncEngines
       self.userDatabase = userDatabase
       self.logger = logger
+      self.logEvents = logEvents
       self.metadatabase = try defaultMetadatabase(
         logger: logger,
         url: try URL.metadatabase(
@@ -860,9 +881,9 @@
     }
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
-      #if DEBUG
+      if logEvents {
         logger.log(event, databaseScope: syncEngine.database.databaseScope.label)
-      #endif
+      }
 
       switch event {
       case .accountChange(let changeType):
@@ -964,9 +985,9 @@
         }
       }
 
-      #if DEBUG
-        let state = LockIsolated(NextRecordZoneChangeBatchLoggingState())
-        defer {
+      let state = logEvents ? LockIsolated(NextRecordZoneChangeBatchLoggingState()) : nil
+      defer {
+        if logEvents, let state = state {
           let state = state.withValue(\.self)
           if let tabularDescription = state.tabularDescription {
             let message = """
@@ -977,7 +998,7 @@
             logger.debug(message)
           }
         }
-      #endif
+      }
 
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
         guard
@@ -1001,8 +1022,8 @@
         var missingTable: CKRecord.ID?
         var missingRecord: CKRecord.ID?
         var sentRecord: CKRecord.ID?
-        #if DEBUG
-          defer {
+        defer {
+          if logEvents, let state = state {
             state.withValue { [missingTable, missingRecord, sentRecord] in
               if let missingTable {
                 $0.events.append("⚠️ Missing table")
@@ -1021,7 +1042,7 @@
               }
             }
           }
-        #endif
+        }
 
         guard let table = tablesByName[metadata.recordType]
         else {
