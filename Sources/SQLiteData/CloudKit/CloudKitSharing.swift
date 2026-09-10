@@ -174,7 +174,7 @@
       try await userDatabase.write { db in
         try SyncMetadata
           .where { $0.recordName.eq(recordName) }
-          .update { $0.share = sharedRecord }
+          .update { $0.share = #bind(sharedRecord) }
           .execute(db)
       }
 
