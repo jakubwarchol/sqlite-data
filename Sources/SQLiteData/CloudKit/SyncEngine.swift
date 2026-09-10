@@ -2230,7 +2230,7 @@
         for table in tables {
           func open<T>(_: some SynchronizableTable<T>) throws {
             let columnsWithUniqueConstraints = try PragmaIndexList<T>
-              .where { $0.isUnique && $0.origin != "pk" }
+              .where { $0.isUnique && $0.origin.neq("pk") }
               .select(\.name)
               .fetchAll(db)
             if !columnsWithUniqueConstraints.isEmpty {
