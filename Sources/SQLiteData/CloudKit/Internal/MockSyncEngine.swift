@@ -9,6 +9,7 @@
     package let database: MockCloudDatabase
     package let parentSyncEngine: SyncEngine
     package let state: MockSyncEngineState
+    package let _fetchChangesOverride = LockIsolated<(@Sendable () async throws -> Void)?>(nil)
     package let _fetchChangesScopes = LockIsolated<[CKSyncEngine.FetchChangesOptions.Scope]>([])
     package let _acceptedShareMetadata = LockIsolated<Set<ShareMetadata>>([])
 
@@ -31,6 +32,10 @@
     }
 
     package func fetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
+      if let operation = _fetchChangesOverride.value {
+        try await operation()
+        return
+      }
       let modifications: [CKRecord]
       let zoneIDs: [CKRecordZone.ID]
       switch options.scope {
@@ -70,17 +75,19 @@
         return records
       }
 
-      guard !modifications.isEmpty || !deletions.isEmpty
-      else { return }
+      await parentSyncEngine.handleEvent(.willFetchChanges, syncEngine: self)
 
       state.changeTag.withValue { changeTag in
         changeTag = modifications.compactMap(\._recordChangeTag).max() ?? changeTag
       }
 
-      await parentSyncEngine.handleEvent(
-        .fetchedRecordZoneChanges(modifications: modifications, deletions: deletions),
-        syncEngine: self
-      )
+      if !modifications.isEmpty || !deletions.isEmpty {
+        await parentSyncEngine.handleEvent(
+          .fetchedRecordZoneChanges(modifications: modifications, deletions: deletions),
+          syncEngine: self
+        )
+      }
+      await parentSyncEngine.handleEvent(.didFetchChanges, syncEngine: self)
     }
 
     package func sendChanges(_ options: CKSyncEngine.SendChangesOptions) async throws {
