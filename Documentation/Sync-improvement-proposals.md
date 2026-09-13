@@ -1,13 +1,14 @@
 # Optional sync improvements — awaiting individual decisions
 
 [Checked fetch completion](Fetch-completion-patch.md) and
-[structured diagnostics](Sync-diagnostics.md) are implemented in this fork as
+[structured diagnostics](Sync-diagnostics.md), and
+[durable outgoing intent](Durable-outgoing-intent.md) are implemented in this fork as
 separate focused patches. The other rows remain proposals awaiting individual
 decisions, each with its own tests and migration review.
 
 | Proposal | Problem / intended contract | Evidence required before adoption |
 | --- | --- | --- |
-| Durable outgoing intent | A committed local insert, update or deletion must remain uploadable after abrupt termination, including deletion tombstones and failed acknowledgements. Capture intent transactionally with the user write. | Subprocess crash windows around commit, enqueue, server acceptance and acknowledgement; retry identity and sidecar consistency. |
+| Durable outgoing intent (L1) — implemented | A committed local insert, update or deletion must remain uploadable after abrupt termination, including deletion tombstones and failed acknowledgements. Capture intent transactionally with the user write. | Debug/release regressions and ten subprocess crash/reopen scenarios passed; see [contract and limits](Durable-outgoing-intent.md). |
 | Durable failed-download journal and replay | A caught apply failure must retain enough information to replay records and deletions even when CloudKit advances its change token. Recovery must prove application before clearing workflow holds. | Failed update/delete/asset, retry after relaunch, checkpoint ordering, partial transactions and repeated failures. |
 | Awaitable stop and draining | Callers need to know that an old engine cannot write or recreate triggers before replacing it. | Suspend each callback, stop, release, and verify no old-generation writes; no delegate deadlock. |
 | Account identity isolation | Data from account A must not upload to B during sign-out/switch, including changes already queued before the app sees the account event. | Two-account transitions during startup/fetch/send, offline writes, stale callbacks and retained stores. Requires the draining boundary. |
@@ -19,3 +20,11 @@ decisions, each with its own tests and migration review.
 Cloud record compatibility, existing clocks and unknown-field preservation should
 be retained unless a proposal explicitly includes a reviewed migration. No
 proposal establishes visibility into edits that another device has not uploaded.
+
+## Practical value assessment
+
+For Daily, L2–L5 are recommended follow-ups: failed-download recovery, awaited
+shutdown, account isolation and a small explicit startup-result contract. L6
+(public revision acknowledgements) and L7 (a public shared test transport) are
+deferred until a concrete app feature needs them. The private receipt tracking
+and crash probe used by L1 do not add either public API.

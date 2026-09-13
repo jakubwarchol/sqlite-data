@@ -206,7 +206,8 @@
           parentRecordPrimaryKey,
           parentRecordType
         )
-      } onConflictDoUpdate: { _ in
+      } onConflictDoUpdate: {
+        $0._isDeleted = false
       }
     }
 
@@ -325,7 +326,7 @@
             )
           )
         } when: { old, new in
-          old._isDeleted.eq(new._isDeleted) && !SyncEngine.$isSynchronizing
+          !new._isDeleted && !SyncEngine.$isSynchronizing
         }
       )
     }

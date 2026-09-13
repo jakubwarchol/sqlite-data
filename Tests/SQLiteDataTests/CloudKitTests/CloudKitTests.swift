@@ -472,7 +472,8 @@
             [3]: "sqlitedata_icloud_diddelete",
             [4]: "sqlitedata_icloud_didupdate",
             [5]: "sqlitedata_icloud_haspermission",
-            [6]: "sqlitedata_icloud_syncengineissynchronizingchanges"
+            [6]: "sqlitedata_icloud_shareidentity",
+            [7]: "sqlitedata_icloud_syncengineissynchronizingchanges"
           ]
           """
         }

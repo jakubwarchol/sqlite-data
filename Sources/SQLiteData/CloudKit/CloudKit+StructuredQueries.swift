@@ -212,6 +212,7 @@
       return withErrorReporting(.sqliteDataCloudKitFailure) {
         do { try dataManager.save(Data(newValue), to: fileURL) }
         catch {
+          SyncRecordEncodingContext.failed?.withValue { $0 = true }
           reportSyncDiagnosticError(error)
           throw error
         }
@@ -280,6 +281,7 @@
               at: userModificationTime
             )
           case .invalid(let error):
+            SyncRecordEncodingContext.failed?.withValue { $0 = true }
             reportSyncDiagnosticError(error)
             reportIssue(error)
           }
@@ -333,6 +335,7 @@
             case .uuid(let value):
               return other.encryptedValues[key] != value.uuidString.lowercased()
             case .invalid(let error):
+              SyncRecordEncodingContext.failed?.withValue { $0 = true }
               reportSyncDiagnosticError(error)
               reportIssue(error)
               return false

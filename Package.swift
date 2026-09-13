@@ -163,3 +163,11 @@ for target in package.targets {
     .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0")
   )
 #endif
+
+#if os(macOS)
+  package.targets.append(.executableTarget(
+    name: "OutgoingIntentCrashProbe",
+    dependencies: ["SQLiteData", .product(name: "Dependencies", package: "swift-dependencies")],
+    path: "Tools/OutgoingIntentCrashProbe"
+  ))
+#endif

@@ -197,15 +197,14 @@
               try RemindersList.find(1).update { $0.title += "!" }.execute(db)
             }
           }
-          try await Task.sleep(for: .seconds(0.5))
-
+          // The intent is committed synchronously in the user file; no task needs flushing.
+          let pending = try await userDatabase.read { db in
+            try String.fetchAll(db, sql: "SELECT recordName FROM main.sqlitedata_icloud_outgoingIntents")
+          }
+          #expect(pending == ["1:remindersLists"])
           assertQuery(PendingRecordZoneChange.all, database: syncEngine.metadatabase) {
             """
-            ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-            │ PendingRecordZoneChange(                                                                    │
-            │   pendingRecordZoneChange: .saveRecord(CKRecord.ID(1:remindersLists/zone/__defaultOwner__)) │
-            │ )                                                                                           │
-            └─────────────────────────────────────────────────────────────────────────────────────────────┘
+            (No results)
             """
           }
           assertQuery(RemindersList.all, database: userDatabase.database) {
