@@ -22,7 +22,12 @@
       let applied = try #require(events.first { $0.kind == .applicationFinished && $0.scope == .private })
       #expect(applied.outcome == .applied)
       #expect(applied.recordTypes == ["remindersLists"])
-      #expect(received.operationID == applied.operationID)
+      #expect(received.operationID == events.first { $0.kind == .fetchStarted && $0.scope == .private }?.operationID)
+      #expect(applied.operationID != nil)
+      // Durable replay may be driven by either scope's checkpoint or by startup.
+      // It must never attribute private application to a shared transfer.
+      let sharedOperations = Set(events.filter { $0.scope == .shared }.compactMap(\.operationID))
+      #expect(!sharedOperations.contains(try #require(applied.operationID)))
       #expect(received.sequence < applied.sequence)
       #expect(applied.durationSeconds != nil)
       #expect(Set(events.filter { $0.kind == .fetchFinished }.compactMap(\.scope)) == [.private, .shared])
@@ -97,11 +102,11 @@
       let engine = fixture.engine
       let container = try #require(engine.container as? MockCloudContainer)
       container._accountStatus.withValue { $0 = .noAccount }
-      try await engine.start()
+      await #expect(throws: SyncEngine.StartupError.self) { try await engine.start() }
       engine.stop()
       await #expect(throws: SyncEngine.FetchCompletionError.self) { try await engine.fetchChangesAndApply() }
       let events = await fixture.collected()
-      #expect(events.contains { $0.kind == .startupFinished && $0.outcome == .unavailable })
+      #expect(events.contains { $0.kind == .startupFinished && $0.outcome == .failed })
       #expect(events.contains { $0.kind == .stopReturned && $0.outcome == .callbackCompleted })
       #expect(events.contains { $0.kind == .requestFinished && $0.outcome == .failed })
       #expect(!events.contains { $0.kind == .startupFinished && $0.outcome == .prepared })

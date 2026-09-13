@@ -1,8 +1,9 @@
 # Incoming recovery, drained shutdown, and account isolation (L2–L4)
 
 These patches build on durable outgoing intent, checked fetch completion, and
-structured diagnostics. They do not implement the optional L5 startup-result,
-L6 public revision-receipt, or L7 public shared-server APIs.
+structured diagnostics. [L5 explicit startup outcomes](Sync-startup.md) were
+implemented subsequently. L6 public revision-receipt and L7 public shared-server
+APIs remain deferred.
 
 ## Incoming recovery (L2)
 

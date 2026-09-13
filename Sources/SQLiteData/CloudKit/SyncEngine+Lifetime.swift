@@ -46,7 +46,7 @@
       retirementTask.withValue { task in
         task = Task { [workTracker] in
           await SyncWorkContext.$token.withValue(nil) {
-            await startup?.value
+            _ = await startup?.result
             async let privateCancellation: Void = engines.private?.cancelOperations() ?? ()
             async let sharedCancellation: Void = engines.shared?.cancelOperations() ?? ()
             _ = await (privateCancellation, sharedCancellation)

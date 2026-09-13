@@ -44,13 +44,14 @@
     let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
-    let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    let startTask = LockIsolated<Task<Void, any Error>?>(nil)
     let workTracker = SyncWorkTracker()
     let startStopLock = NSRecursiveLock()
     let isDraining = LockIsolated(false)
     let isResetting = LockIsolated(false)
     let retirementTask = LockIsolated<Task<Void, Never>?>(nil)
-    let isolatedStartTask = LockIsolated<Task<Void, Error>?>(nil)
+    let startupTask = LockIsolated<Task<SyncWorkTracker.Token, any Error>?>(nil)
+    let startup = LockIsolated<StartupState>(.stopped)
     let accountIsolation: SyncAccountIsolation?
     let accountAdoptionID = UUID()
     let authorizedAccount = LockIsolated<String?>(nil)
@@ -178,8 +179,7 @@
         )
         try setUpSyncEngine()
         if startImmediately ?? !isTesting {
-          if accountIsolation != nil { _ = try requestIsolatedStart() }
-          else { _ = try start() }
+          _ = try requestStart()
         }
         return
       }
@@ -222,8 +222,7 @@
       )
       try setUpSyncEngine()
       if startImmediately ?? !isTesting {
-        if accountIsolation != nil { _ = try requestIsolatedStart() }
-        else { _ = try start() }
+        _ = try requestStart()
       }
     }
 
@@ -407,21 +406,6 @@
       }
     }
 
-    /// Starts the sync engine if it is stopped.
-    ///
-    /// When a sync engine is started it will upload all data stored locally that has not yet
-    /// been synchronized to CloudKit, and will download all changes from CloudKit since the
-    /// last time it synchronized.
-    ///
-    /// > Note: By default, sync engines start syncing when initialized.
-    public func start() async throws {
-      if accountIsolation != nil { try await isolatedStart(); return }
-      guard SyncWorkContext.token?.tracker !== workTracker else { throw LifetimeError.reentrantDrain }
-      await retirementTask.value?.value
-      try await start().value
-      try Task.checkCancellation()
-    }
-
     /// Determines if the sync engine is currently sending local changes to the CloudKit server.
     ///
     /// It is an observable value, which means if it is accessed in a SwiftUI view, or some other
@@ -468,7 +452,8 @@
         #if DEBUG && canImport(DeveloperToolsSupport)
           previewTimerTask.withValue { $0?.cancel(); $0 = nil }
         #endif
-        isolatedStartTask.withValue { $0?.cancel(); $0 = nil }
+        startupTask.withValue { $0?.cancel(); $0 = nil }
+        setStartupState(.stopped)
         let retired = syncEngines.value
         workTracker.retire()
         observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
@@ -484,7 +469,8 @@
       }
     }
 
-    /// Determines if the sync engine is currently running or not.
+    /// Whether the underlying transports are allocated, including during preparation.
+    /// Use `startupState`, `isPrepared`, or await `start()` for preparation success.
     public var isRunning: Bool {
       observationRegistrar.access(self, keyPath: \.isRunning)
       return syncEngines.withValue {
@@ -492,27 +478,7 @@
       }
     }
 
-    private func start() throws -> Task<Void, Never> {
-      try startStopLock.withLock {
-        guard !isDraining.value, !isResetting.value else { throw LifetimeError.draining }
-        guard !isRunning else { return startTask.value ?? Task {} }
-        workTracker.activate()
-        let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(stage: .startupStarted) }
-        return try SyncWorkContext.$token.withValue(workTracker.token) {
-          try SyncDiagnosticContext.$operation.withValue(context) {
-            emitDiagnostic(.startupStarted, outcome: .started)
-            do { return try prepareStart() }
-            catch {
-              diagnosticFailure(error)
-              emitDiagnostic(.startupFinished, level: .error, outcome: .failed, finished: true)
-              throw error
-            }
-          }
-        }
-      }
-    }
-
-    func prepareStart() throws -> Task<Void, Never> {
+    func prepareStart() throws -> Task<Void, any Error> {
       outgoingReady.withValue { $0 = false }
       try observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         try syncEngines.withValue {
@@ -593,31 +559,28 @@
         }
       #endif
       let startupLease = try workTracker.begin(expected: SyncWorkContext.token)
-      let startTask = Task<Void, Never> {
+      let startTask = Task<Void, any Error> {
         defer { startupLease.finish() }
-        var outcome = SyncDiagnostic.Outcome.prepared
-        await self.withFetchErrorReporting {
-          try SyncWorkContext.token?.check()
-          guard try await container.accountStatus() == .available
-          else { outcome = .unavailable; return }
-          try SyncWorkContext.token?.check()
-          syncEngines.withValue {
-            $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
-          }
-          try await uploadRecordsToCloudKit(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await updateLocalFromSchemaChange(
-            previousRecordTypeByTableName: previousRecordTypeByTableName,
-            currentRecordTypeByTableName: currentRecordTypeByTableName
-          )
-          try await cacheUserTables(recordTypes: currentRecordTypes)
-          await replayIncomingChanges()
+        try SyncWorkContext.token?.check()
+        let status = try await container.accountStatus()
+        guard status == .available else { throw StartupError.accountUnavailable(status) }
+        try SyncWorkContext.token?.check()
+        syncEngines.withValue {
+          $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
         }
-        let failed = (SyncDiagnosticContext.operation?.counts.value["errors", default: 0] ?? 0) > 0
-        emitDiagnostic(.startupFinished, level: failed ? .error : .info,
-                       outcome: failed ? .failed : outcome, finished: true)
+        try await uploadRecordsToCloudKit(
+          previousRecordTypeByTableName: previousRecordTypeByTableName,
+          currentRecordTypeByTableName: currentRecordTypeByTableName
+        )
+        try await updateLocalFromSchemaChange(
+          previousRecordTypeByTableName: previousRecordTypeByTableName,
+          currentRecordTypeByTableName: currentRecordTypeByTableName
+        )
+        try await cacheUserTables(recordTypes: currentRecordTypes)
+        // Retained downloads have their own checked-fetch/recovery contract. Their
+        // failure does not prevent starting the transport needed to recover them.
+        await replayIncomingChanges()
+        try SyncWorkContext.token?.check()
       }
       self.startTask.withValue {
         $0?.cancel()
@@ -646,7 +609,7 @@
     }
 
     private func fetchChangesImpl(_ options: CKSyncEngine.FetchChangesOptions) async throws {
-      await startTask.withValue(\.self)?.value
+      try await startupTask.value?.value.check()
       let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
         ($0.private, $0.shared)
       }
@@ -677,7 +640,7 @@
     }
 
     private func sendChangesImpl(_ options: CKSyncEngine.SendChangesOptions) async throws {
-      await startTask.withValue(\.self)?.value
+      try await startupTask.value?.value.check()
       let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
         ($0.private, $0.shared)
       }
@@ -854,15 +817,13 @@
         }
         // Finish the maintenance lease before any new generation can start. A concurrent
         // stop invalidates this token and prevents the reset request from restarting later.
-        let restarting: Task<Void, Error> = try startStopLock.withLock {
+        let restarting = try startStopLock.withLock {
           try lease.token.check()
           lease.finish()
           isResetting.withValue { $0 = false }
-          if accountIsolation != nil { return try requestIsolatedStart() }
-          let preparation = try start()
-          return Task { await preparation.value }
+          return try requestStart()
         }
-        try await restarting.value
+        try await restarting.value.check()
       } catch {
         startStopLock.withLock { lease.finish(); isResetting.withValue { $0 = false } }
         stop()

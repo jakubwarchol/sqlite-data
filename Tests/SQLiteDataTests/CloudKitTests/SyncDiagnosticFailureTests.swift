@@ -10,6 +10,28 @@
   @Suite(.timeLimit(.minutes(1)))
   struct SyncDiagnosticFailureTests {
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    @Test func replayDrivenByAnotherScopeDoesNotBorrowItsOperationID() async throws {
+      let f = try SyncDiagnosticsFixture()
+      defer { f.engine.stop() }
+      try await f.start()
+      _ = try await f.remoteUpdate()
+      f.engine.private._automaticallyCheckpoint.withValue { $0 = false }
+      try await f.engine.fetchChanges()
+      try await f.engine.userDatabase.userWrite { db in
+        try IncomingJournal.commitCheckpoint("{\"mockChangeTag\":1}", scope: .private, db: db)
+      }
+      await f.clear()
+      let shared = f.engine.makeDiagnosticOperation(scope: .shared, stage: .fetchStarted)
+      await SyncDiagnosticContext.$operation.withValue(shared) {
+        await f.engine.replayIncomingChanges()
+      }
+      let applied = try #require(await f.collected().first { $0.kind == .applicationFinished })
+      #expect(applied.outcome == .applied)
+      #expect(applied.scope == .private)
+      #expect(applied.operationID != shared.id)
+    }
+
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     @Test func outgoingAssetFailureMakesBatchPreparationPartial() async throws {
       let fixture = try SyncDiagnosticsFixture()
       let engine = fixture.engine

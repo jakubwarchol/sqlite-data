@@ -238,7 +238,11 @@
       )
       try setUpSyncEngine()
       if startImmediately {
-        try await start()
+        do { try await start() }
+        catch let StartupError.accountUnavailable(status) {
+          #expect(status == (container as? MockCloudContainer)?._accountStatus.value)
+          #expect(!isRunning)
+        }
       }
     }
   }

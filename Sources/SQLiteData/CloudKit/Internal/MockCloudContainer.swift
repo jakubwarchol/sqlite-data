@@ -6,6 +6,7 @@
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package final class MockCloudContainer: CloudContainer {
     package let _accountStatus: LockIsolated<CKAccountStatus>
+    package let _accountStatusOverride = LockIsolated<(@Sendable () async throws -> CKAccountStatus)?>(nil)
     package let _userRecordID = LockIsolated(CKRecord.ID(recordName: "mock-user"))
     package let _userRecordIDOverride = LockIsolated<(@Sendable () async throws -> CKRecord.ID)?>(nil)
     package let containerIdentifier: String?
@@ -39,7 +40,8 @@
     }
 
     package func accountStatus() async throws -> CKAccountStatus {
-      _accountStatus.withValue { $0 }
+      if let operation = _accountStatusOverride.value { return try await operation() }
+      return _accountStatus.withValue { $0 }
     }
 
     package func userRecordID() async throws -> CKRecord.ID {

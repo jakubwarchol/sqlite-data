@@ -66,9 +66,12 @@
     }
 
     private func replayIncomingEntry(_ entry: IncomingJournal) async throws -> Bool {
+      let scope: SyncDiagnostic.Scope = entry.id.zoneID.ownerName == CKCurrentUserDefaultName ? .private : .shared
+      let parent = SyncDiagnosticContext.operation
+      // Either scope can drive the shared durable replay queue. Do not attach a
+      // private application to a shared transfer (or to unscoped startup).
       let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(
-        scope: entry.id.zoneID.ownerName == CKCurrentUserDefaultName ? .private : .shared,
-        stage: .applicationFinished, parent: SyncDiagnosticContext.operation
+        scope: scope, stage: .applicationFinished, parent: parent?.scope == scope ? parent : nil
       ) }
       return try await SyncDiagnosticContext.$operation.withValue(context) {
         do {

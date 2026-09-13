@@ -30,57 +30,7 @@
     public func adoptLocalDataForCurrentAccount(_ request: SyncAccountAdoption) async throws {
       guard request.engine == accountAdoptionID else { throw SyncAccountIsolationError.adoptionRequired }
       try await stopAndDrain()
-      try await isolatedStart(adopting: request.fingerprint)
-    }
-
-    func isolatedStart(adopting expected: String? = nil) async throws {
-      guard SyncWorkContext.token?.tracker !== workTracker else { throw LifetimeError.reentrantDrain }
-      await retirementTask.value?.value
-      do {
-        try await requestIsolatedStart(adopting: expected).value
-        try Task.checkCancellation()
-      } catch {
-        stop()
-        await retirementTask.value?.value
-        throw error
-      }
-    }
-
-    /// Register the complete account lookup/start request before scheduling it. A stop during
-    /// an uncooperative account lookup must still drain its lease and reject its eventual write.
-    func requestIsolatedStart(adopting expected: String? = nil) throws -> Task<Void, Error> {
-      try startStopLock.withLock {
-        guard !isDraining.value, !isResetting.value else { throw LifetimeError.draining }
-        if let existing = isolatedStartTask.value { return existing }
-        workTracker.activate()
-        let lease = try workTracker.begin()
-        let task = Task<Void, Error> {
-          defer { lease.finish() }
-          try await SyncWorkContext.$token.withValue(lease.token) {
-            let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(stage: .startupStarted) }
-            try await SyncDiagnosticContext.$operation.withValue(context) {
-              emitDiagnostic(.startupStarted, outcome: .started)
-              do {
-                try await authorizeAccount(adopting: expected)
-                try lease.token.check()
-                let preparation = try startStopLock.withLock {
-                  try lease.token.check()
-                  return try prepareStart()
-                }
-                await preparation.value
-                try lease.token.check()
-              } catch {
-                if let failure = error as? SyncAccountIsolationError { setAccountFailure(failure) }
-                diagnosticFailure(error)
-                emitDiagnostic(.startupFinished, level: .error, outcome: .failed, finished: true)
-                throw error
-              }
-            }
-          }
-        }
-        isolatedStartTask.withValue { $0 = task }
-        return task
-      }
+      try await awaitStart(adopting: request.fingerprint)
     }
 
     private func currentAccountFingerprint() async throws -> String {
@@ -93,7 +43,7 @@
                                                 environment: isolation.environment.rawValue)
     }
 
-    private func authorizeAccount(adopting expected: String?) async throws {
+    func authorizeAccount(adopting expected: String?) async throws {
       guard let isolation = accountIsolation else { return }
       let fingerprint = try await currentAccountFingerprint()
       if let expected, expected != fingerprint { throw SyncAccountIsolationError.accountChangedDuringAdoption }

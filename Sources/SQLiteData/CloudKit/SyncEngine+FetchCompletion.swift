@@ -44,7 +44,7 @@
         $0.isChecking = true
       }
       defer { fetchCompletion.withValue { $0.isChecking = false } }
-      await startTask.withValue(\.self)?.value
+      try await startupTask.value?.value.check()
       try Task.checkCancellation()
       let (privateEngine, sharedEngine) = syncEngines.withValue { ($0.private, $0.shared) }
       guard let privateEngine, let sharedEngine else { throw FetchCompletionError.notRunning }
