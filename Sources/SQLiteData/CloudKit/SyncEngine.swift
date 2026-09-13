@@ -1498,6 +1498,13 @@
           }
           open(table)
         }
+        // Recovery-generated uploads need the same durable ownership as user writes.
+        // Rows from another zone have no matching metadata and were already skipped by encoding.
+        for case .saveRecord(let id) in pendingRecordZoneChanges {
+          if try SyncMetadata.find(id).fetchOne(db) != nil {
+            try OutgoingIntent.adopt(.saveRecord(id), db: db)
+          }
+        }
         syncEngine.state.add(pendingRecordZoneChanges: pendingRecordZoneChanges)
       }
     }
@@ -1695,7 +1702,7 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
-      await acknowledgeOutgoing(savedRecords: savedRecords, deletedRecordIDs: deletedRecordIDs,
+      let failureGuards = await acknowledgeOutgoing(savedRecords: savedRecords, deletedRecordIDs: deletedRecordIDs,
         failedRecordSaves: failedRecordSaves, failedRecordDeletes: failedRecordDeletes, syncEngine: syncEngine)
 
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
@@ -1710,9 +1717,11 @@
         }
       }
       for (failedRecord, error) in failedRecordSaves {
+        let failureGuard = failureGuards.saves[failedRecord.recordID]
         func clearServerRecord() async {
           await withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
+              guard try failureGuard?.allowsRecovery(db) != false else { return }
               try SyncMetadata
                 .find(failedRecord.recordID)
                 .update { $0.setLastKnownServerRecord(nil) }
@@ -1724,7 +1733,7 @@
         switch error.code {
         case .serverRecordChanged:
           guard let serverRecord = error.serverRecord else { continue }
-          await upsertFromServerRecord(serverRecord)
+          await upsertFromServerRecord(serverRecord, failureGuard: failureGuard)
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
 
         case .zoneNotFound:
@@ -1740,7 +1749,7 @@
         case .serverRejectedRequest:
           // A replay of a create may already exist after its first acknowledgement was lost.
           if let serverRecord = error.serverRecord {
-            await upsertFromServerRecord(serverRecord)
+            await upsertFromServerRecord(serverRecord, failureGuard: failureGuard)
             newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
           } else {
             await clearServerRecord()
@@ -1757,6 +1766,7 @@
           }
           func open<T>(_: some SynchronizableTable<T>) async throws {
             try await userDatabase.write { db in
+              guard try failureGuard?.allowsRecovery(db) != false else { return }
               try $_isSynchronizingChanges.withValue(false) {
                 switch foreignKey.onDelete {
                 case .cascade:
@@ -1817,9 +1827,10 @@
               let serverRecord = try await container.sharedCloudDatabase.record(
                 for: failedRecord.recordID
               )
-              await upsertFromServerRecord(serverRecord, force: true)
+              await upsertFromServerRecord(serverRecord, force: true, failureGuard: failureGuard)
             } catch let error as CKError where error.code == .unknownItem {
               try await userDatabase.write { db in
+                guard try failureGuard?.allowsRecovery(db) != false else { return }
                 try T
                   .unscoped
                   .where { #sql("\($0.primaryKey) = \(bind: recordPrimaryKey)") }
@@ -1861,6 +1872,7 @@
             for (failedRecordID, error) in failedRecordDeletes {
               switch error.code {
               case .referenceViolation:
+                guard try failureGuards.deletes[failedRecordID]?.allowsRecovery(db) != false else { continue }
                 enqueuedUnsyncedRecordID = true
                 try UnsyncedRecordID.insert {
                   UnsyncedRecordID(recordID: failedRecordID)
@@ -1947,10 +1959,12 @@
 
     private func upsertFromServerRecord(
       _ serverRecord: CKRecord,
-      force: Bool = false
+      force: Bool = false,
+      failureGuard: OutgoingFailureGuard? = nil
     ) async {
       await withFetchErrorReporting {
         try await userDatabase.write { db in
+          guard try failureGuard?.allowsRecovery(db) != false else { return }
           upsertFromServerRecord(serverRecord, force: force, db: db)
         }
       }

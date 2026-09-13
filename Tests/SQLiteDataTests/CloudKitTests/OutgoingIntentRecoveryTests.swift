@@ -110,6 +110,29 @@
     }
 
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    @Test func encryptionResetReuploadSurvivesSchedulingStateLoss() async throws {
+      let f = try SyncDiagnosticsFixture()
+      defer { f.engine.stop() }
+      try await f.start()
+      try await f.engine.userDatabase.userWrite { db in
+        try RemindersList.insert { RemindersList(id: 1, title: "Retain") }.execute(db)
+      }
+      try await f.engine.processPendingRecordZoneChanges(scope: .private)
+      let id = RemindersList.recordID(for: 1, zoneID: f.engine.defaultZone.zoneID)
+      let before = try #require(try f.engine.private.database.record(for: id)["_recordChangeTag"] as? Int)
+      #expect(try await f.engine.userDatabase.read { try OutgoingIntent.fetch($0).count } == 0)
+      await f.engine.handleEvent(.fetchedDatabaseChanges(modifications: [],
+        deletions: [(f.engine.defaultZone.zoneID, .encryptedDataReset)]), syncEngine: f.engine.private)
+      #expect(try await f.engine.userDatabase.read { try OutgoingIntent.fetch($0).count } == 1)
+      f.engine.stop()
+      try await f.engine.start()
+      try await f.engine.processPendingRecordZoneChanges(scope: .private)
+      let after = try #require(try f.engine.private.database.record(for: id)["_recordChangeTag"] as? Int)
+      #expect(after > before, "The server must receive a new upload, not merely retain its old record")
+      #expect(try await f.engine.userDatabase.read { try OutgoingIntent.fetch($0).count } == 0)
+    }
+
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     @Test func wrongContainerCannotAdoptJournal() async throws {
       let f = try SyncDiagnosticsFixture()
       defer { f.engine.stop() }

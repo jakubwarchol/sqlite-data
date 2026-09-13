@@ -74,7 +74,8 @@
       savedRecords: [CKRecord], deletedRecordIDs: [CKRecord.ID],
       failedRecordSaves: [(record: CKRecord, error: CKError)], failedRecordDeletes: [CKRecord.ID: CKError],
       syncEngine: any SyncEngineProtocol
-    ) async {
+    ) async -> OutgoingFailureGuards {
+      var guards = OutgoingFailureGuards()
       for record in savedRecords {
         let receipt = outgoingAttempts.completed(record.recordID, isDelete: false, engine: syncEngine)
         await withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
@@ -93,6 +94,8 @@
       }
       for failure in failedRecordSaves {
         let receipt = outgoingAttempts.completed(failure.record.recordID, isDelete: false, engine: syncEngine)
+        guards.saves[failure.record.recordID] = OutgoingFailureGuard(
+          recordID: failure.record.recordID, revision: receipt?.intent.revision)
         if failure.error.code == .permissionFailure, let receipt {
           await withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
@@ -106,8 +109,10 @@
         }
       }
       for (id, error) in failedRecordDeletes where error.code != .unknownItem {
-        _ = outgoingAttempts.completed(id, isDelete: true, engine: syncEngine)
+        let receipt = outgoingAttempts.completed(id, isDelete: true, engine: syncEngine)
+        guards.deletes[id] = OutgoingFailureGuard(recordID: id, revision: receipt?.intent.revision)
       }
+      return guards
     }
 
     func refreshLastKnownServerRecord(_ record: CKRecord, db: Database) throws {

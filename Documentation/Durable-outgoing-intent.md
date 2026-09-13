@@ -23,12 +23,17 @@ transaction. Conversion/asset errors prevent that record from being offered to
 CloudKit, even with diagnostics disabled. An internal receipt identifies the
 prepared revision. Success clears only that revision, in the transaction that
 updates cached server metadata. A newer save, deletion or recreated primary key
-survives an older receipt. Uncertain overlapping attempts retain intent for retry.
+survives an older receipt. Failure recovery also checks the prepared revision inside
+its database write, after any network suspension; an older conflict or permission
+response cannot revive a newer deletion or overwrite a newer edit. Uncertain
+overlapping attempts retain intent for retry.
 
 CloudKit state remains a scheduling cache. Startup restores journaled metadata,
 adopts the legacy pending queue and serialized pending state without overwriting
 newer intent, and schedules retained work. Adoption and removal from the legacy
-queue share one transaction. The journal is never cleared merely because work
+queue share one transaction. Encryption-reset recovery journals reuploads too, so
+losing scheduling state before the next send does not lose that work. The journal
+is never cleared merely because work
 was added to CKSyncEngine state. A lost acknowledgement can cause another upload
 of the same identity; there is no exactly-once network-delivery claim.
 
@@ -83,7 +88,8 @@ The regression group includes existing CloudKit/checked-fetch/diagnostics tests,
 plus outgoing-intent tests for rollback, failure to write the journal, lost and
 failed acknowledgements, late success after newer edits/deletions/recreation,
 ambiguous overlapping callbacks, metadata reconstruction, legacy queue adoption,
-container mismatch, zone moves and asset encoding with diagnostics disabled.
+container mismatch, zone moves, encryption-reset reuploads across restart, delayed
+conflict/permission failures, and asset encoding with diagnostics disabled.
 
 ```sh
 swift test --jobs 8 --filter 'BaseCloudKitTests|SyncDiagnostic|OutgoingIntent'
@@ -98,10 +104,10 @@ to verify the journal and replay the operation. Running/stopped insert, update
 and delete, three rollback cases, and acceptance without a received callback
 make ten scenarios. No live accounts, production databases or resets are used.
 
-Final local results: debug **230 tests / 37 suites**, release **228 tests / 36
+Final local results: debug **233 tests / 38 suites**, release **231 tests / 37
 suites**, both passed with nine existing/deliberately injected known issues.
-Two existing DEBUG-only tests explain the count difference. All 13 new L1 test
+Two existing DEBUG-only tests explain the count difference. All 16 new L1 test
 declarations passed. The ten subprocess scenarios passed against both debug and
-release executables. All 141 recorded source/test/tool inputs remained unchanged
+release executables. All 143 recorded source/test/tool inputs remained unchanged
 through final verification. No dependency versions were changed. Signed-device
 CloudKit delivery remains separate acceptance.

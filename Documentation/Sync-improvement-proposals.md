@@ -1,6 +1,6 @@
 # Optional sync improvements — awaiting individual decisions
 
-[Checked fetch completion](Fetch-completion-patch.md) and
+[Checked fetch completion](Fetch-completion-patch.md),
 [structured diagnostics](Sync-diagnostics.md), and
 [durable outgoing intent](Durable-outgoing-intent.md) are implemented in this fork as
 separate focused patches. The other rows remain proposals awaiting individual
