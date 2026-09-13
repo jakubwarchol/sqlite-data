@@ -1,8 +1,9 @@
 # Optional sync improvements — awaiting individual decisions
 
-Only [checked fetch completion](Fetch-completion-patch.md) is implemented in this
-fork. These are proposals, not accepted implementation scope. Each should be a
-separate patch with its own tests and migration review.
+[Checked fetch completion](Fetch-completion-patch.md) and
+[structured diagnostics](Sync-diagnostics.md) are implemented in this fork as
+separate focused patches. The other rows remain proposals awaiting individual
+decisions, each with its own tests and migration review.
 
 | Proposal | Problem / intended contract | Evidence required before adoption |
 | --- | --- | --- |
@@ -13,7 +14,7 @@ separate patch with its own tests and migration review.
 | Startup result | `isRunning` should not imply successful preparation when asynchronous startup work fails. | Fail schema preparation/account lookup/triggers and verify explicit failure, retry and ownership. |
 | Upload acknowledgements | Report specific accepted record revisions separately from pending work and fetch state. | Server acceptance followed by dropped acknowledgement, conflicts and partial batch errors. |
 | Supported shared test transport | Let independent public test engines share one controllable server without package internals. | Multi-client convergence, deterministic event scheduling, failure injection and stable test API. |
-| App-supplied structured sync diagnostics (L8) | Expose production-capable lifecycle, fetch/apply/send outcomes, partial failures and retry information to an injectable, entity-independent sink. Apps choose OSLog, Sentry or another destination. See [the investigation and contract](Sync-diagnostics-proposal.md). | Release-build emission, accurate stage/outcome labels, correlation, redaction, bounded delivery, duplicate suppression and no change to sync behavior. |
+| App-supplied structured sync diagnostics (L8) — implemented | Production-capable lifecycle, fetch/apply/send outcomes, partial failures and retry information through an injectable, entity-independent sink. Apps choose OSLog, Sentry or another destination. | See [implementation and validation](Sync-diagnostics.md); the [original investigation](Sync-diagnostics-proposal.md) is retained. |
 
 Cloud record compatibility, existing clocks and unknown-field preservation should
 be retained unless a proposal explicitly includes a reviewed migration. No

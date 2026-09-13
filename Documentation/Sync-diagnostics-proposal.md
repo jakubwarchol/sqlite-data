@@ -1,6 +1,8 @@
 # App-supplied structured sync diagnostics (L8)
 
-Investigated 13 September 2026. **Proposal only; no runtime extension implemented.**
+Investigated 13 September 2026. The user subsequently authorized implementation;
+see [the implemented API and its limits](Sync-diagnostics.md). The text below
+preserves the investigation and proposed contract.
 This accompanies the [optional improvement list](Sync-improvement-proposals.md).
 
 ## Current capabilities and gaps

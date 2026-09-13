@@ -28,6 +28,10 @@
     /// or a durable receipt across process termination. It cannot see another device's unsent
     /// edits or prevent changes arriving after it returns. Never call from a sync delegate event.
     public func fetchChangesAndApply() async throws {
+      try await diagnoseRequest(.checkedFetchRequested) { try await checkedFetchImpl() }
+    }
+
+    private func checkedFetchImpl() async throws {
       try fetchCompletion.withValue {
         guard !$0.isChecking else { throw FetchCompletionError.alreadyFetching }
         $0.isChecking = true
@@ -94,6 +98,7 @@
         do { return try operation() }
         catch {
           fetchCompletion.withValue { $0.localFailure = $0.localFailure ?? error }
+          diagnosticFailure(error)
           throw error
         }
       }
@@ -110,6 +115,7 @@
         do { return try await operation() }
         catch {
           fetchCompletion.withValue { $0.localFailure = $0.localFailure ?? error }
+          diagnosticFailure(error)
           throw error
         }
       }

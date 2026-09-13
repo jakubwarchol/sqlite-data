@@ -210,7 +210,11 @@
       )
       let asset = CKAsset(fileURL: fileURL)
       return withErrorReporting(.sqliteDataCloudKitFailure) {
-        try dataManager.save(Data(newValue), to: fileURL)
+        do { try dataManager.save(Data(newValue), to: fileURL) }
+        catch {
+          reportSyncDiagnosticError(error)
+          throw error
+        }
         self[key] = asset
         encryptedValues[at: key] = userModificationTime
         encryptedValues[hash: key] = hash
@@ -276,6 +280,7 @@
               at: userModificationTime
             )
           case .invalid(let error):
+            reportSyncDiagnosticError(error)
             reportIssue(error)
           }
         }
@@ -328,6 +333,7 @@
             case .uuid(let value):
               return other.encryptedValues[key] != value.uuidString.lowercased()
             case .invalid(let error):
+              reportSyncDiagnosticError(error)
               reportIssue(error)
               return false
             }
