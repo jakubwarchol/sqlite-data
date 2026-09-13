@@ -2,16 +2,16 @@
 
 [Checked fetch completion](Fetch-completion-patch.md),
 [structured diagnostics](Sync-diagnostics.md), and
-[durable outgoing intent](Durable-outgoing-intent.md) are implemented in this fork as
-separate focused patches. The other rows remain proposals awaiting individual
-decisions, each with its own tests and migration review.
+[durable outgoing intent](Durable-outgoing-intent.md), and
+[incoming recovery, drain and account isolation](Sync-recovery-and-account-isolation.md)
+are implemented in this fork. L5–L7 remain proposals with separate decisions and acceptance.
 
 | Proposal | Problem / intended contract | Evidence required before adoption |
 | --- | --- | --- |
 | Durable outgoing intent (L1) — implemented | A committed local insert, update or deletion must remain uploadable after abrupt termination, including deletion tombstones and failed acknowledgements. Capture intent transactionally with the user write. | Debug/release regressions and ten subprocess crash/reopen scenarios passed; see [contract and limits](Durable-outgoing-intent.md). |
-| Durable failed-download journal and replay | A caught apply failure must retain enough information to replay records and deletions even when CloudKit advances its change token. Recovery must prove application before clearing workflow holds. | Failed update/delete/asset, retry after relaunch, checkpoint ordering, partial transactions and repeated failures. |
-| Awaitable stop and draining | Callers need to know that an old engine cannot write or recreate triggers before replacing it. | Suspend each callback, stop, release, and verify no old-generation writes; no delegate deadlock. |
-| Account identity isolation | Data from account A must not upload to B during sign-out/switch, including changes already queued before the app sees the account event. | Two-account transitions during startup/fetch/send, offline writes, stale callbacks and retained stores. Requires the draining boundary. |
+| Durable failed-download journal and replay (L2) — implemented | A caught apply failure must retain enough information to replay records and deletions even when CloudKit advances its change token. Recovery must prove application before clearing workflow holds. | Failed update/delete/asset, retry after relaunch, checkpoint ordering, partial transactions and repeated failures. |
+| Awaitable stop and draining (L3) — implemented | Callers need to know that an old engine cannot write or recreate triggers before replacing it. | Suspend each callback, stop, release, and verify no old-generation writes; no delegate deadlock. |
+| Account identity isolation (L4) — implemented | Data from account A must not upload to B during sign-out/switch, including changes already queued before the app sees the account event. | Two-account transitions during startup/fetch/send, offline writes, stale callbacks and retained stores. Requires the draining boundary. |
 | Startup result | `isRunning` should not imply successful preparation when asynchronous startup work fails. | Fail schema preparation/account lookup/triggers and verify explicit failure, retry and ownership. |
 | Upload acknowledgements | Report specific accepted record revisions separately from pending work and fetch state. | Server acceptance followed by dropped acknowledgement, conflicts and partial batch errors. |
 | Supported shared test transport | Let independent public test engines share one controllable server without package internals. | Multi-client convergence, deterministic event scheduling, failure injection and stable test API. |
@@ -23,7 +23,7 @@ proposal establishes visibility into edits that another device has not uploaded.
 
 ## Practical value assessment
 
-For Daily, L2–L5 are recommended follow-ups: failed-download recovery, awaited
+Daily authorized and implemented L2–L4. L5 remains a recommended follow-up. The practical priorities are: failed-download recovery, awaited
 shutdown, account isolation and a small explicit startup-result contract. L6
 (public revision acknowledgements) and L7 (a public shared test transport) are
 deferred until a concrete app feature needs them. The private receipt tracking

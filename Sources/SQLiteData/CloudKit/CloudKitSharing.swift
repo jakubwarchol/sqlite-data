@@ -87,6 +87,27 @@
             """
         )
       }
+      return try await withSyncWork {
+        try await requireAccountOwnership()
+        return try await shareImpl(record: record, configure: configure)
+      }
+    }
+
+    private func shareImpl<T: PrimaryKeyedTable>(
+      record: T,
+      configure: @Sendable (CKShare) -> Void
+    ) async throws -> SharedRecord
+    where T.TableColumns.PrimaryKey.QueryOutput: IdentifierStringConvertible {
+      guard isRunning
+      else {
+        throw SharingError(
+          reason: .syncEngineNotRunning,
+          debugDescription: """
+            Sync engine is not running. Make sure engine is running by invoking the 'start()' \
+            method, or using the 'startImmediately' argument when initializing the engine.
+            """
+        )
+      }
       guard tablesByName[T.tableName] != nil
       else {
         throw SharingError(
@@ -179,6 +200,7 @@
         )
 
       configure(sharedRecord)
+      try await requireAccountOwnership()
       let (saveResults, _) = try await container.database(for: sharedRecord.recordID).modifyRecords(
         saving: [sharedRecord, lastKnownServerRecord],
         deleting: []
@@ -205,6 +227,7 @@
             """
         )
       }
+      try await requireAccountOwnership()
       try await userDatabase.write { db in
         try SyncMetadata
           .where { $0.recordName.eq(recordName) }
@@ -219,6 +242,14 @@
     }
 
     public func unshare<T: PrimaryKeyedTable>(record: T) async throws
+    where T.TableColumns.PrimaryKey.QueryOutput: IdentifierStringConvertible {
+      try await withSyncWork {
+        try await requireAccountOwnership()
+        try await unshareImpl(record: record)
+      }
+    }
+
+    private func unshareImpl<T: PrimaryKeyedTable>(record: T) async throws
     where T.TableColumns.PrimaryKey.QueryOutput: IdentifierStringConvertible {
       let share = try await metadatabase.read { [recordName = record.recordName] db in
         try SyncMetadata
@@ -241,6 +272,13 @@
     }
 
     func unshare(share: CKShare) async throws {
+      try await withSyncWork {
+        try await requireAccountOwnership()
+        try await unshareOwned(share: share)
+      }
+    }
+
+    private func unshareOwned(share: CKShare) async throws {
       let result = try await syncEngines.private?.database.modifyRecords(
         saving: [],
         deleting: [share.recordID]

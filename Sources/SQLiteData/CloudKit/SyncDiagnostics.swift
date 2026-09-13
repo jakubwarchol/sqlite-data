@@ -43,9 +43,9 @@
     }
 
     public enum Kind: String, Sendable, Codable {
-      case startupStarted, startupFinished, stopRequested, stopReturned, accountChanged
+      case startupStarted, startupFinished, stopRequested, stopReturned, drainWaiting, drainFinished, accountChanged
       case fetchStarted, fetchFinished, zoneFetchStarted, zoneFetchFinished
-      case changesReceived, applicationFinished, statePersisted
+      case changesReceived, incomingStaged, applicationFinished, statePersisted
       case sendStarted, sendFinished, batchPrepared, uploadResults, zoneUploadResults
       case retryEnqueued, operationFailed, invariantViolation, eventsDropped
       case fetchRequested, sendRequested, checkedFetchRequested, requestFinished
@@ -54,7 +54,7 @@
     public enum Scope: String, Sendable, Codable { case `private`, shared, `public` }
     public enum Outcome: String, Sendable, Codable {
       case started, callbackCompleted, applied, accepted, partial, failed, cancelled
-      case deferred, skipped, prepared, unavailable
+      case deferred, skipped, prepared, unavailable, retained
     }
 
     public struct Failure: Sendable, Codable, Equatable, Hashable {

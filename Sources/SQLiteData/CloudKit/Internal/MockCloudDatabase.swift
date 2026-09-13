@@ -15,7 +15,7 @@
       private var lastRecordChangeTag = 0
       package var storage: [CKRecordZone.ID: Zone] = [:]
       var assets: [AssetID: Data] = [:]
-      var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
+      var deletedRecords: [(id: CKRecord.ID, type: CKRecord.RecordType, changeTag: Int)] = []
       mutating func nextRecordChangeTag() -> Int {
         lastRecordChangeTag += 1
         return lastRecordChangeTag
@@ -109,6 +109,7 @@
 
       return state.withValue { state in
         let previousStorage = state.storage
+        let previousDeletions = state.deletedRecords
         var saveResults: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
         var deleteResults: [CKRecord.ID: Result<Void, any Error>] = [:]
 
@@ -290,7 +291,8 @@
           state.storage[recordIDToDelete.zoneID]?.records[recordIDToDelete] = nil
           deleteResults[recordIDToDelete] = .success(())
           if let recordType = recordToDelete?.recordType {
-            state.deletedRecords.append((recordIDToDelete, recordType))
+            let tag = state.nextRecordChangeTag()
+            state.deletedRecords.append((recordIDToDelete, recordType, tag))
           }
 
           // NB: If deleting a share that the current user owns, delete the shared records and all
@@ -310,7 +312,8 @@
                 }
                 state.storage[recordIDToDelete.zoneID]?.records[recordToDelete.recordID] = nil
                 deleteResults[recordToDelete.recordID] = .success(())
-                state.deletedRecords.append((recordIDToDelete, recordToDelete.recordType))
+                let tag = state.nextRecordChangeTag()
+                state.deletedRecords.append((recordToDelete.recordID, recordToDelete.recordType, tag))
                 deleteRecords(referencing: recordToDelete.recordID)
               }
             }
@@ -352,6 +355,8 @@
           }
           // All storage changes are reverted in zone.
           state.storage[zoneID]?.records = previousStorage[zoneID]?.records ?? [:]
+          state.deletedRecords.removeAll { $0.id.zoneID == zoneID }
+          state.deletedRecords.append(contentsOf: previousDeletions.filter { $0.id.zoneID == zoneID })
         }
         return (saveResults: saveResults, deleteResults: deleteResults)
       }

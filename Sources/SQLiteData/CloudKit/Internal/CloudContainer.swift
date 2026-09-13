@@ -6,6 +6,7 @@
     associatedtype Database: CloudDatabase
 
     func accountStatus() async throws -> CKAccountStatus
+    func userRecordID() async throws -> CKRecord.ID
     var containerIdentifier: String? { get }
     var rawValue: CKContainer { get }
     var privateCloudDatabase: Database { get }

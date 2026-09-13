@@ -171,3 +171,11 @@ for target in package.targets {
     path: "Tools/OutgoingIntentCrashProbe"
   ))
 #endif
+
+#if os(macOS)
+  package.targets.append(.executableTarget(
+    name: "IncomingRecoveryCrashProbe",
+    dependencies: ["SQLiteData", .product(name: "Dependencies", package: "swift-dependencies")],
+    path: "Tools/IncomingRecoveryCrashProbe"
+  ))
+#endif

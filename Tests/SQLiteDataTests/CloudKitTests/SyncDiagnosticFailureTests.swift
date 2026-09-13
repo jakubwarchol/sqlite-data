@@ -96,11 +96,12 @@
     }
 
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-    @Test func metadataReadFailureRemainsNilButIsObservable() async throws {
+    @Test func checkpointReadFailureThrowsAndIsObservable() async throws {
       let fixture = try SyncDiagnosticsFixture()
       let emptyDatabase = try DatabaseQueue()
-      let state = fixture.engine.diagnosticStateSerialization(in: emptyDatabase, scope: .private)
-      #expect(state == nil)
+      #expect(throws: DatabaseError.self) {
+        try fixture.engine.diagnosticStateSerialization(in: emptyDatabase, scope: .private)
+      }
       let events = await fixture.collected()
       #expect(events.contains { $0.kind == .operationFailed && $0.failures.first?.category == .sqlite })
     }

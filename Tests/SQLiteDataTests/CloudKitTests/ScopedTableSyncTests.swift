@@ -124,9 +124,9 @@
           recordType: ScopedModel.tableName,
           recordID: ScopedModel.recordID(for: 1)
         )
-        serverRecord["id"] = 1
-        serverRecord["title"] = "from-server"
-        serverRecord["isDeleted"] = 1
+        serverRecord.setValue(1, forKey: "id", at: now + 1)
+        serverRecord.setValue("from-server", forKey: "title", at: now + 1)
+        serverRecord.setValue(1, forKey: "isDeleted", at: now + 1)
         await syncEngine.handleEvent(
           SyncEngine.Event.fetchedRecordZoneChanges(
             modifications: [serverRecord],
@@ -139,6 +139,7 @@
           let rows = try ScopedModel.unscoped.fetchAll(db)
           #expect(rows.count == 1)
           #expect(rows.first?.isDeleted == true)
+          #expect(rows.first?.title == "from-server")
         }
       }
     }

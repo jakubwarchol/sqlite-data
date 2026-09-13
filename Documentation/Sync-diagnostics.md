@@ -1,5 +1,9 @@
 # Structured sync diagnostics
 
+Current L2–L4 behavior and migration are described in
+[Sync recovery and account isolation](Sync-recovery-and-account-isolation.md).
+The original patch's verification record below is retained.
+
 The optional `diagnostics:` argument on `SyncEngine` exposes sanitized events in
 debug **and release** builds. It is independent of the existing `OSLog.Logger`
 argument and does not add a logging backend dependency.

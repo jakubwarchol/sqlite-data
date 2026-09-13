@@ -14,7 +14,7 @@
     @MainActor
     final class AccountLifecycleTests: BaseCloudKitTests, @unchecked Sendable {
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func signOutClearsUserDatabaseAndMetadatabase() async throws {
+      @Test func signOutRetainsUserDatabaseAndMetadatabase() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
             RemindersList(id: 1, title: "Personal")
@@ -28,14 +28,14 @@
         await signOut()
 
         try await userDatabase.read { db in
-          try #expect(RemindersList.count().fetchOne(db) == 0)
-          try #expect(Reminder.count().fetchOne(db) == 0)
-          try #expect(RemindersListPrivate.count().fetchOne(db) == 0)
+          try #expect(RemindersList.count().fetchOne(db) == 1)
+          try #expect(Reminder.count().fetchOne(db) == 1)
+          try #expect(RemindersListPrivate.count().fetchOne(db) == 1)
           try #expect(UnsyncedModel.count().fetchOne(db) == 1)
         }
 
         try await syncEngine.metadatabase.read { db in
-          try #expect(SyncMetadata.count().fetchOne(db) == 0)
+          try #expect(SyncMetadata.count().fetchOne(db) == 3)
         }
       }
 

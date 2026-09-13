@@ -61,7 +61,7 @@
       switch event {
       case .stateUpdate: .statePersisted
       case .accountChange: .accountChanged
-      case .fetchedDatabaseChanges, .fetchedRecordZoneChanges: .applicationFinished
+      case .fetchedDatabaseChanges, .fetchedRecordZoneChanges: .incomingStaged
       case .sentDatabaseChanges: .zoneUploadResults
       case .sentRecordZoneChanges: .uploadResults
       case .willFetchChanges, .didFetchChanges: .fetchStarted
@@ -130,16 +130,15 @@
         } else {
           types = []
         }
-        let deferred = counts["deferred", default: 0] > 0
-        let ignored = counts["ignored", default: 0] > 0
         emitDiagnostic(
-          .applicationFinished, level: failed || deferred ? .warning : .info,
-          outcome: failed ? .failed : deferred ? .deferred : ignored ? .partial : .applied,
+          .incomingStaged, level: failed ? .warning : .debug,
+          outcome: counts["captureFailed", default: 0] > 0 ? .failed : .retained,
           counts: counts, recordTypes: types, finished: true
         )
       case .stateUpdate:
-        emitDiagnostic(.statePersisted, level: failed ? .error : .debug,
-                       outcome: failed ? .failed : .applied, counts: counts, finished: true)
+        let persisted = counts["checkpointCommitted", default: 0] > 0
+        emitDiagnostic(.statePersisted, level: persisted ? .debug : .error,
+                       outcome: persisted ? .applied : .failed, counts: counts, finished: true)
       case .didFetchChanges, .didSendChanges:
         let sending: Bool = if case .didSendChanges = event { true } else { false }
         let partial = counts["deliveryFailures", default: 0] > 0

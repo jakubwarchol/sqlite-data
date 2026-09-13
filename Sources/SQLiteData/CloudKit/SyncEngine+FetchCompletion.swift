@@ -23,12 +23,19 @@
     /// success. Missing foreign-key dependencies also prevent success. Concurrent calls to this
     /// method throw `alreadyFetching`; ordinary background synchronization remains enabled.
     ///
-    /// Local apply failures are retained for this engine's lifetime: a later empty fetch cannot
-    /// prove the failed changes were replayed. This is a completion check, not a repair mechanism
-    /// or a durable receipt across process termination. It cannot see another device's unsent
+    /// Downloaded payloads and checkpoints are retained transactionally. Failed application is
+    /// retried from that journal and blocks success until replay completes. Failures outside the
+    /// durable incoming path remain sticky; an empty fetch cannot prove those were repaired.
+    /// This completion check is not a durable receipt across process termination. It cannot see another device's unsent
     /// edits or prevent changes arriving after it returns. Never call from a sync delegate event.
     public func fetchChangesAndApply() async throws {
-      try await diagnoseRequest(.checkedFetchRequested) { try await checkedFetchImpl() }
+      try await diagnoseRequest(.checkedFetchRequested) {
+        guard isRunning else { throw FetchCompletionError.notRunning }
+        try await withSyncWork {
+          try await requireAccountOwnership()
+          try await checkedFetchImpl()
+        }
+      }
     }
 
     private func checkedFetchImpl() async throws {
@@ -41,8 +48,9 @@
       try Task.checkCancellation()
       let (privateEngine, sharedEngine) = syncEngines.withValue { ($0.private, $0.shared) }
       guard let privateEngine, let sharedEngine else { throw FetchCompletionError.notRunning }
+      await replayIncomingChanges()
       let before = fetchCompletion.value
-      if let error = before.localFailure { throw FetchCompletionError.localApplicationFailed(error) }
+      if let error = before.untrackedLocalFailure { throw FetchCompletionError.localApplicationFailed(error) }
       let status = try await container.accountStatus()
       guard status == .available else { throw FetchCompletionError.accountUnavailable(status) }
 
@@ -57,6 +65,8 @@
         throw error
       }
       try Task.checkCancellation()
+      await replayIncomingChanges()
+      let inboxCount = try await incomingPendingCount()
       let pendingCount = try await metadatabase.read { db in
         try UnsyncedRecordID.count().fetchOne(db) ?? 0
       }
@@ -64,6 +74,7 @@
       let sameEngines = syncEngines.withValue {
         $0.private === privateEngine && $0.shared === sharedEngine
       }
+      try await requireAccountOwnership()
       let after = fetchCompletion.value
       guard sameEngines, before.accountGeneration == after.accountGeneration
       else { throw FetchCompletionError.invalidated }
@@ -76,7 +87,9 @@
         guard after.completed[id, default: 0] > before.completed[id, default: 0]
         else { throw FetchCompletionError.incomplete }
       }
-      guard pendingCount == 0 else { throw FetchCompletionError.unappliedRecords(pendingCount) }
+      guard pendingCount + inboxCount == 0 else {
+        throw FetchCompletionError.unappliedRecords(pendingCount + inboxCount)
+      }
     }
 
     private func fetchBothDatabases(
@@ -92,12 +105,20 @@
       line: UInt = #line, column: UInt = #column,
       _ operation: () throws -> R
     ) -> R? {
-      withErrorReporting(
+      if let failure = IncomingApplyContext.failure {
+        do { return try operation() }
+        catch { failure.withValue { $0 = $0 ?? error }; return nil }
+      }
+      return withErrorReporting(
         .sqliteDataCloudKitFailure, fileID: fileID, filePath: filePath, line: line, column: column
       ) {
         do { return try operation() }
+        catch is CancellationError { return nil }
         catch {
-          fetchCompletion.withValue { $0.localFailure = $0.localFailure ?? error }
+          fetchCompletion.withValue {
+            $0.localFailure = $0.localFailure ?? error
+            $0.untrackedLocalFailure = $0.untrackedLocalFailure ?? error
+          }
           diagnosticFailure(error)
           throw error
         }
@@ -109,12 +130,20 @@
       line: UInt = #line, column: UInt = #column,
       _ operation: () async throws -> sending R
     ) async -> R? {
-      await withErrorReporting(
+      if let failure = IncomingApplyContext.failure {
+        do { return try await operation() }
+        catch { failure.withValue { $0 = $0 ?? error }; return nil }
+      }
+      return await withErrorReporting(
         .sqliteDataCloudKitFailure, fileID: fileID, filePath: filePath, line: line, column: column
       ) {
         do { return try await operation() }
+        catch is CancellationError { return nil }
         catch {
-          fetchCompletion.withValue { $0.localFailure = $0.localFailure ?? error }
+          fetchCompletion.withValue {
+            $0.localFailure = $0.localFailure ?? error
+            $0.untrackedLocalFailure = $0.untrackedLocalFailure ?? error
+          }
           diagnosticFailure(error)
           throw error
         }
@@ -126,6 +155,7 @@
   struct FetchCompletionState: Sendable {
     var isChecking = false
     var localFailure: (any Error)?
+    var untrackedLocalFailure: (any Error)?
     var accountGeneration = 0
     var completed: [ObjectIdentifier: Int] = [:]
     var zoneFailureGeneration = 0

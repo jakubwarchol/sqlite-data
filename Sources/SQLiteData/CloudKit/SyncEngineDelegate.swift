@@ -1,80 +1,18 @@
 #if canImport(CloudKit)
   public import CloudKit
-  import CustomDump
-  import IssueReporting
 
-  /// An interface for observing ``SyncEngine`` events and customizing ``SyncEngine`` behavior.
+  /// Observes account changes after the engine has fenced unsafe work.
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public protocol SyncEngineDelegate: AnyObject, Sendable {
-    /// An event indicating a change to the device's iCloud account.
+    /// Sign-out and account switches stop synchronization and retain local data, including
+    /// unsent edits and incoming recovery payloads. The default implementation does nothing.
     ///
-    /// By default, a sync engine will clear out local data when detecting a logout or account
-    /// change. To override this behavior, _e.g._ if you want to prompt the user and let them decide
-    /// if they want to clear their local data or not, implement this method, and explicitly call
-    /// ``SyncEngine/deleteLocalData()`` if/when the data should be cleared.
+    /// Update application presentation here, then return. The resource owner can subsequently
+    /// await `stopAndDrain()` before closing or replacing the database. Awaiting retirement or
+    /// calling `deleteLocalData()` inside this callback throws `LifetimeError.reentrantDrain`.
     ///
-    /// For example, an observable model could override this method to set up some alert state:
-    ///
-    /// ```swift
-    /// @MainActor
-    /// @Observable
-    /// class MySyncEngineDelegate: SyncEngineDelegate {
-    ///   var isResetDataAlertPresented = false
-    ///
-    ///   func syncEngine(
-    ///     _ syncEngine: SyncEngine,
-    ///     accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
-    ///   ) {
-    ///     switch changeType {
-    ///     case .signOut, .switchAccounts:
-    ///       isResetDataAlertPresented = true
-    ///     case .signIn:
-    ///       break
-    ///     }
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// And then SwiftUI could drive an alert with this state:
-    ///
-    /// ```swift
-    /// struct MyApp: App {
-    ///   @State var syncEngineDelegate = MySyncEngineDelegate()
-    ///
-    ///   init() {
-    ///     prepareDependencies {
-    ///       try! $0.bootstrapDatabase(syncEngineDelegate: syncEngineDelegate)
-    ///     }
-    ///   }
-    ///
-    ///   var body: some Scene {
-    ///     WindowGroup {
-    ///       MyRootView()
-    ///         .alert(
-    ///           "Reset local data?",
-    ///           isPresented: $syncEngineDelegate.isDeleteLocalDataAlertPresented
-    ///         ) {
-    ///           Button("Reset", role: .destructive) {
-    ///             Task {
-    ///               try await syncEngine.deleteLocalData()
-    ///             }
-    ///           }
-    ///         } message: {
-    ///           Text(
-    ///             """
-    ///             You are no longer logged into iCloud. Would you like to reset your local data \
-    ///             to the defaults? This will not affect your data in iCloud.
-    ///             """
-    ///           )
-    ///         }
-    ///     }
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// - Parameters:
-    ///   - syncEngine: The sync engine that generates the event.
-    ///   - changeType: The iCloud account's change type.
+    /// Enable `SyncAccountIsolation` to persist account ownership across launches and prevent
+    /// restarting an account's store under another account. Explicit deletion never reassigns it.
     func syncEngine(
       _ syncEngine: SyncEngine,
       accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
@@ -86,17 +24,6 @@
     public func syncEngine(
       _ syncEngine: SyncEngine,
       accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
-    ) async {
-      switch changeType {
-      case .signOut, .switchAccounts:
-        await withErrorReporting {
-          try await syncEngine.deleteLocalData()
-        }
-      case .signIn:
-        break
-      @unknown default:
-        break
-      }
-    }
+    ) async { }
   }
 #endif

@@ -17,15 +17,9 @@
 
     func diagnosticStateSerialization(
       in database: any DatabaseReader, scope: CKDatabase.Scope
-    ) -> CKSyncEngine.State.Serialization? {
-      do {
-        return try database.read { db in
-          try StateSerialization.find(#bind(scope)).select(\.data).fetchOne(db)
-        }
-      } catch {
-        diagnosticFailure(error)
-        return nil
-      }
+    ) throws -> CKSyncEngine.State.Serialization? {
+      do { return try database.read { try IncomingJournal.checkpoint($0, scope: scope) } }
+      catch { diagnosticFailure(error); throw error }
     }
 
     func emitDiagnostic(

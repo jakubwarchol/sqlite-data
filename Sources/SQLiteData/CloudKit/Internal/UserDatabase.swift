@@ -19,10 +19,12 @@
     package func write<T: Sendable>(
       _ updates: @Sendable (Database) throws -> T
     ) async throws -> T {
-      try await database.write { db in
-        try $_isSynchronizingChanges.withValue(true) {
-          try updates(db)
-        }
+      let token = SyncWorkContext.token
+      return try await database.write { db in
+        try token?.check()
+        let result = try $_isSynchronizingChanges.withValue(true) { try updates(db) }
+        try token?.check()
+        return result
       }
     }
 
@@ -38,10 +40,12 @@
     package func write<T>(
       _ updates: (Database) throws -> T
     ) throws -> T {
-      try database.write { db in
-        try $_isSynchronizingChanges.withValue(true) {
-          try updates(db)
-        }
+      let token = SyncWorkContext.token
+      return try database.write { db in
+        try token?.check()
+        let result = try $_isSynchronizingChanges.withValue(true) { try updates(db) }
+        try token?.check()
+        return result
       }
     }
 

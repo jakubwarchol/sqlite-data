@@ -1,5 +1,9 @@
 # Focused fetch-completion patch
 
+Current L2–L4 behavior and migration are described in
+[Sync recovery and account isolation](Sync-recovery-and-account-isolation.md).
+The original patch's verification record below is retained.
+
 This fork starts from upstream **1.12.0**, commit
 `164bb5f223738af3d5da7a1b8de14e67e4d9cd5d`. Previous fork-specific logging
 changes are not included. The only addition is checked fetch completion and its

@@ -10,6 +10,8 @@
     package let parentSyncEngine: SyncEngine
     package let state: MockSyncEngineState
     package let _fetchChangesOverride = LockIsolated<(@Sendable () async throws -> Void)?>(nil)
+    package let _automaticallyCheckpoint = LockIsolated(true)
+    package let _cancelOperationsOverride = LockIsolated<(@Sendable () async -> Void)?>(nil)
     package let _fetchChangesScopes = LockIsolated<[CKSyncEngine.FetchChangesOptions.Scope]>([])
     package let _acceptedShareMetadata = LockIsolated<Set<ShareMetadata>>([])
 
@@ -65,20 +67,18 @@
         }
       }
 
-      let deletions = database.state.withValue {
-        let records = $0.deletedRecords.filter { recordID, _ in
-          zoneIDs.contains(recordID.zoneID)
+      let deletionHistory = database.state.withValue { cloudState in
+        cloudState.deletedRecords.filter { deletion in
+          zoneIDs.contains(deletion.id.zoneID) && deletion.changeTag > state.changeTag.value
+            && cloudState.storage[deletion.id.zoneID]?.records[deletion.id] == nil
         }
-        $0.deletedRecords.removeAll { lhsRecordID, _ in
-          records.contains { rhsRecordID, _ in lhsRecordID == rhsRecordID }
-        }
-        return records
       }
+      let deletions = deletionHistory.map { ($0.id, $0.type) }
 
       await parentSyncEngine.handleEvent(.willFetchChanges, syncEngine: self)
 
       state.changeTag.withValue { changeTag in
-        changeTag = modifications.compactMap(\._recordChangeTag).max() ?? changeTag
+        changeTag = (modifications.compactMap(\._recordChangeTag) + deletionHistory.map(\.changeTag)).max() ?? changeTag
       }
 
       if !modifications.isEmpty || !deletions.isEmpty {
@@ -138,6 +138,7 @@
     }
 
     package func cancelOperations() async {
+      await _cancelOperationsOverride.value?()
     }
   }
 

@@ -38,14 +38,27 @@
     let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
       @Sendable (any DatabaseReader, SyncEngine)
-        -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol)
+        throws -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol)
     package let container: any CloudContainer
     let dataManager = Dependency(\.dataManager)
-    private let observationRegistrar = ObservationRegistrar()
+    let observationRegistrar = ObservationRegistrar()
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
     let startTask = LockIsolated<Task<Void, Never>?>(nil)
+    let workTracker = SyncWorkTracker()
+    let startStopLock = NSRecursiveLock()
+    let isDraining = LockIsolated(false)
+    let isResetting = LockIsolated(false)
+    let retirementTask = LockIsolated<Task<Void, Never>?>(nil)
+    let isolatedStartTask = LockIsolated<Task<Void, Error>?>(nil)
+    let accountIsolation: SyncAccountIsolation?
+    let accountAdoptionID = UUID()
+    let authorizedAccount = LockIsolated<String?>(nil)
+    let pendingAccountAdoption = LockIsolated<String?>(nil)
+    let accountFailure = LockIsolated<SyncAccountIsolationError?>(nil)
     let fetchCompletion = LockIsolated(FetchCompletionState())
+    let incomingReplayGate = IncomingReplayGate()
+    let incomingCheckpointBlocked = LockIsolated<Set<CKDatabase.Scope>>([])
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
@@ -103,7 +116,8 @@
       delegate: (any SyncEngineDelegate)? = nil,
       logger: Logger = isTesting
         ? Logger(.disabled) : Logger(subsystem: "SQLiteData", category: "CloudKit"),
-      diagnostics: SyncDiagnostics? = nil
+      diagnostics: SyncDiagnostics? = nil,
+      accountIsolation: SyncAccountIsolation? = nil
     ) throws
     where
       repeat (each T1).PrimaryKey.QueryOutput: IdentifierStringConvertible,
@@ -140,17 +154,17 @@
         try self.init(
           container: container,
           defaultZone: defaultZone,
-          defaultSyncEngines: { _, syncEngine in
+          defaultSyncEngines: { database, syncEngine in
             (
               private: MockSyncEngine(
                 database: privateDatabase,
                 parentSyncEngine: syncEngine,
-                state: MockSyncEngineState()
+                state: try syncEngine.restoredMockState(in: database, scope: .private)
               ),
               shared: MockSyncEngine(
                 database: sharedDatabase,
                 parentSyncEngine: syncEngine,
-                state: MockSyncEngineState()
+                state: try syncEngine.restoredMockState(in: database, scope: .shared)
               )
             )
           },
@@ -159,11 +173,13 @@
           delegate: delegate,
           tables: allTables,
           privateTables: allPrivateTables,
-          diagnostics: diagnostics
+          diagnostics: diagnostics,
+          accountIsolation: accountIsolation
         )
         try setUpSyncEngine()
         if startImmediately ?? !isTesting {
-          _ = try start()
+          if accountIsolation != nil { _ = try requestIsolatedStart() }
+          else { _ = try start() }
         }
         return
       }
@@ -176,20 +192,22 @@
       try self.init(
         container: container,
         defaultZone: defaultZone,
-        defaultSyncEngines: { metadatabase, syncEngine in
-          (
+        defaultSyncEngines: { database, syncEngine in
+          let privateState = try syncEngine.diagnosticStateSerialization(in: database, scope: .private)
+          let sharedState = try syncEngine.diagnosticStateSerialization(in: database, scope: .shared)
+          return (
             private: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.privateCloudDatabase,
-                stateSerialization: syncEngine.diagnosticStateSerialization(in: metadatabase, scope: .private),
-                delegate: syncEngine
+                stateSerialization: privateState,
+                delegate: SyncSessionDelegate(owner: syncEngine)
               )
             ),
             shared: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.sharedCloudDatabase,
-                stateSerialization: syncEngine.diagnosticStateSerialization(in: metadatabase, scope: .shared),
-                delegate: syncEngine
+                stateSerialization: sharedState,
+                delegate: SyncSessionDelegate(owner: syncEngine)
               )
             )
           )
@@ -199,11 +217,13 @@
         delegate: delegate,
         tables: allTables,
         privateTables: allPrivateTables,
-        diagnostics: diagnostics
+        diagnostics: diagnostics,
+        accountIsolation: accountIsolation
       )
       try setUpSyncEngine()
       if startImmediately ?? !isTesting {
-        _ = try start()
+        if accountIsolation != nil { _ = try requestIsolatedStart() }
+        else { _ = try start() }
       }
     }
 
@@ -214,19 +234,21 @@
         @escaping @Sendable (
           any DatabaseReader,
           SyncEngine
-        ) -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol),
+        ) throws -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol),
       userDatabase: UserDatabase,
       logger: Logger,
       delegate: (any SyncEngineDelegate)?,
       tables: [any SynchronizableTable],
       privateTables: [any SynchronizableTable] = [],
-      diagnostics: SyncDiagnostics? = nil
+      diagnostics: SyncDiagnostics? = nil,
+      accountIsolation: SyncAccountIsolation? = nil
     ) throws {
       let allTables = OrderedSet((tables + privateTables).map(HashableSynchronizedTable.init))
         .map(\.type)
       self.tables = allTables
       self.privateTables = privateTables
       self.delegate = delegate
+      self.accountIsolation = accountIsolation
       self.diagnosticEmitter = diagnostics.map(SyncDiagnosticEmitter.init)
 
       let foreignKeysByTableName = Dictionary(
@@ -285,15 +307,11 @@
             forName: UIApplication.willResignActiveNotification,
             object: nil,
             queue: nil
-          ) { [syncEngines] _ in
-            _ = Task { @MainActor in
+          ) { [weak self] _ in
+            _ = Task { @MainActor [weak self] in
               let taskIdentifier = UIApplication.shared.beginBackgroundTask()
               defer { UIApplication.shared.endBackgroundTask(taskIdentifier) }
-              let (privateSyncEngine, sharedSyncEngine) = syncEngines.withValue {
-                ($0.private, $0.shared)
-              }
-              try await privateSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
-              try await sharedSyncEngine?.sendChanges(CKSyncEngine.SendChangesOptions())
+              try await self?.sendChanges()
             }
           }
         }
@@ -367,6 +385,12 @@
       db.add(function: $currentOwnerName)
 
       try prepareOutgoingIntents(in: db)
+      try IncomingJournal.create(in: db)
+      if accountIsolation != nil { try SyncAccountBinding.create(db) }
+      else if try db.tableExists(SyncAccountBinding.table),
+        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM main.\(SyncAccountBinding.table))") == true {
+        throw SyncAccountIsolationError.configurationRequired
+      }
 
       for trigger in SyncMetadata.callbackTriggers(for: self) {
         try trigger.execute(db)
@@ -391,7 +415,11 @@
     ///
     /// > Note: By default, sync engines start syncing when initialized.
     public func start() async throws {
+      if accountIsolation != nil { try await isolatedStart(); return }
+      guard SyncWorkContext.token?.tracker !== workTracker else { throw LifetimeError.reentrantDrain }
+      await retirementTask.value?.value
       try await start().value
+      try Task.checkCancellation()
     }
 
     /// Determines if the sync engine is currently sending local changes to the CloudKit server.
@@ -434,19 +462,25 @@
       let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(stage: .stopRequested) }
       emitDiagnostic(.stopRequested, operation: context)
       defer { emitDiagnostic(.stopReturned, operation: context, outcome: .callbackCompleted, finished: true) }
-      guard isRunning else { return }
-      #if DEBUG && canImport(DeveloperToolsSupport)
-        previewTimerTask.withValue {
-          $0?.cancel()
-          $0 = nil
+      startStopLock.withLock {
+        guard !isDraining.value else { return }
+        isDraining.withValue { $0 = true }
+        #if DEBUG && canImport(DeveloperToolsSupport)
+          previewTimerTask.withValue { $0?.cancel(); $0 = nil }
+        #endif
+        isolatedStartTask.withValue { $0?.cancel(); $0 = nil }
+        let retired = syncEngines.value
+        workTracker.retire()
+        observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+          syncEngines.withValue {
+            outgoingAttempts.clear()
+            outgoingReady.withValue { $0 = false }
+            $0 = SyncEngines()
+          }
         }
-      #endif
-      observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          outgoingAttempts.clear()
-          outgoingReady.withValue { $0 = false }
-          $0 = SyncEngines()
-        }
+        fetchingChangesCount = 0
+        sendingChangesCount = 0
+        retire(retired)
       }
     }
 
@@ -459,24 +493,30 @@
     }
 
     private func start() throws -> Task<Void, Never> {
-      guard !isRunning else { return Task {} }
-      let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(stage: .startupStarted) }
-      return try SyncDiagnosticContext.$operation.withValue(context) {
-        emitDiagnostic(.startupStarted, outcome: .started)
-        do { return try prepareStart() }
-        catch {
-          diagnosticFailure(error)
-          emitDiagnostic(.startupFinished, level: .error, outcome: .failed, finished: true)
-          throw error
+      try startStopLock.withLock {
+        guard !isDraining.value, !isResetting.value else { throw LifetimeError.draining }
+        guard !isRunning else { return startTask.value ?? Task {} }
+        workTracker.activate()
+        let context = diagnosticEmitter.map { _ in makeDiagnosticOperation(stage: .startupStarted) }
+        return try SyncWorkContext.$token.withValue(workTracker.token) {
+          try SyncDiagnosticContext.$operation.withValue(context) {
+            emitDiagnostic(.startupStarted, outcome: .started)
+            do { return try prepareStart() }
+            catch {
+              diagnosticFailure(error)
+              emitDiagnostic(.startupFinished, level: .error, outcome: .failed, finished: true)
+              throw error
+            }
+          }
         }
       }
     }
 
-    private func prepareStart() throws -> Task<Void, Never> {
+    func prepareStart() throws -> Task<Void, Never> {
       outgoingReady.withValue { $0 = false }
-      observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
-        syncEngines.withValue {
-          let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
+      try observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
+        try syncEngines.withValue {
+          let (privateSyncEngine, sharedSyncEngine) = try defaultSyncEngines(userDatabase.database, self)
           $0 = SyncEngines(
             private: privateSyncEngine,
             shared: sharedSyncEngine
@@ -552,11 +592,15 @@
           }
         }
       #endif
+      let startupLease = try workTracker.begin(expected: SyncWorkContext.token)
       let startTask = Task<Void, Never> {
+        defer { startupLease.finish() }
         var outcome = SyncDiagnostic.Outcome.prepared
         await self.withFetchErrorReporting {
+          try SyncWorkContext.token?.check()
           guard try await container.accountStatus() == .available
           else { outcome = .unavailable; return }
+          try SyncWorkContext.token?.check()
           syncEngines.withValue {
             $0.private?.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
           }
@@ -569,6 +613,7 @@
             currentRecordTypeByTableName: currentRecordTypeByTableName
           )
           try await cacheUserTables(recordTypes: currentRecordTypes)
+          await replayIncomingChanges()
         }
         let failed = (SyncDiagnosticContext.operation?.counts.value["errors", default: 0] ?? 0) > 0
         emitDiagnostic(.startupFinished, level: failed ? .error : .info,
@@ -592,7 +637,12 @@
     public func fetchChanges(
       _ options: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions()
     ) async throws {
-      try await diagnoseRequest(.fetchRequested) { try await fetchChangesImpl(options) }
+      try await withSyncWork {
+        try await diagnoseRequest(.fetchRequested) {
+          try await requireAccountOwnership()
+          try await fetchChangesImpl(options)
+        }
+      }
     }
 
     private func fetchChangesImpl(_ options: CKSyncEngine.FetchChangesOptions) async throws {
@@ -618,7 +668,12 @@
     public func sendChanges(
       _ options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
-      try await diagnoseRequest(.sendRequested) { try await sendChangesImpl(options) }
+      try await withSyncWork {
+        try await diagnoseRequest(.sendRequested) {
+          try await requireAccountOwnership()
+          try await sendChangesImpl(options)
+        }
+      }
     }
 
     private func sendChangesImpl(_ options: CKSyncEngine.SendChangesOptions) async throws {
@@ -647,8 +702,10 @@
       fetchOptions: CKSyncEngine.FetchChangesOptions = CKSyncEngine.FetchChangesOptions(),
       sendOptions: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions()
     ) async throws {
-      try await sendChanges(sendOptions)
-      try await fetchChanges(fetchOptions)
+      try await withSyncWork {
+        try await sendChanges(sendOptions)
+        try await fetchChanges(fetchOptions)
+      }
     }
 
     private func cacheUserTables(recordTypes: [RecordType]) async throws {
@@ -757,6 +814,8 @@
       try userDatabase.write { db in
         for name in OutgoingIntent.triggerNames { try db.execute(sql: "DROP TRIGGER IF EXISTS \(name)") }
         try db.execute(sql: "DELETE FROM main.\(OutgoingIntent.table)")
+        try db.execute(sql: "DELETE FROM main.\(IncomingJournal.table)")
+        try db.execute(sql: "DELETE FROM main.\(IncomingJournal.checkpoints)")
         for table in tables.reversed() {
           try table.base
             .dropTriggers(defaultZone: defaultZone, privateTables: privateTables, db: db)
@@ -771,30 +830,45 @@
 
     /// Deletes synchronized data locally on device and restarts the sync engine.
     ///
-    /// This method is called automatically by the sync engine when it detects the device's iCloud
-    /// account has logged out or changed. To customize this behavior, provide a
-    /// ``SyncEngineDelegate`` to the sync engine and implement
-    /// ``SyncEngineDelegate/syncEngine(_:accountChanged:)``.
-    ///
-    /// > Important: It is only appropriate to call this method when the device's iCloud account
-    /// > logs out or changes.
+    /// This is an explicit destructive action. Account changes retain local data and stop sync.
+    /// Call from the resource owner after its delegate callback has returned. Account ownership
+    /// is preserved: clearing records never reassigns an owned store to a different account.
     public func deleteLocalData() async throws {
-      stop()
-      try tearDownSyncEngine()
-      await withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
-        try await userDatabase.write { db in
-          for table in tables {
-            func open<T>(_: some SynchronizableTable<T>) {
-              withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
-                try T.delete().execute(db)
-              }
-            }
-            open(table)
-          }
-          try setUpSyncEngine(writableDB: db)
-        }
+      try await stopAndDrain()
+      let lease = try startStopLock.withLock {
+        guard !isDraining.value, !isResetting.value, !isRunning else { throw LifetimeError.draining }
+        workTracker.activate()
+        isResetting.withValue { $0 = true }
+        return try workTracker.begin()
       }
-      try await start()
+      do {
+        try await SyncWorkContext.$token.withValue(lease.token) {
+          try tearDownSyncEngine()
+          try await userDatabase.write { db in
+            for table in tables.reversed() {
+              func open<T>(_: some SynchronizableTable<T>) throws { try T.unscoped.delete().execute(db) }
+              try open(table)
+            }
+            try setUpSyncEngine(writableDB: db)
+          }
+        }
+        // Finish the maintenance lease before any new generation can start. A concurrent
+        // stop invalidates this token and prevents the reset request from restarting later.
+        let restarting: Task<Void, Error> = try startStopLock.withLock {
+          try lease.token.check()
+          lease.finish()
+          isResetting.withValue { $0 = false }
+          if accountIsolation != nil { return try requestIsolatedStart() }
+          let preparation = try start()
+          return Task { await preparation.value }
+        }
+        try await restarting.value
+      } catch {
+        startStopLock.withLock { lease.finish(); isResetting.withValue { $0 = false } }
+        stop()
+        await retirementTask.value?.value
+        throw error
+      }
     }
 
     @DatabaseFunction(
@@ -879,11 +953,20 @@
     }
 
     package func acceptShare(metadata: ShareMetadata) async throws {
+      try await withSyncWork {
+        try await requireAccountOwnership()
+        try await acceptShareImpl(metadata: metadata)
+      }
+    }
+
+    private func acceptShareImpl(metadata: ShareMetadata) async throws {
       guard let rootRecordID = metadata.hierarchicalRootRecordID
       else {
         reportSyncIssue("Attempting to share without root record information.")
         return
       }
+      guard accountIsolation == nil || metadata.containerIdentifier == container.containerIdentifier
+      else { throw SyncAccountIsolationError.differentEnvironment }
       let container = type(of: container).createContainer(identifier: metadata.containerIdentifier)
       _ = try await container.accept(metadata)
       try await syncEngines.shared?.fetchChanges(
@@ -991,9 +1074,18 @@
     }
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
-      await diagnoseEvent(event, engine: syncEngine) {
-        await handleEventImpl(event, syncEngine: syncEngine)
-      }
+      guard acceptsCallback(from: syncEngine) else { return }
+      do {
+        try await withSyncWork {
+          if case .accountChange = event { }
+          else { try await requireAccountOwnership() }
+          try SyncWorkContext.token?.check()
+          await diagnoseEvent(event, engine: syncEngine) {
+            await handleEventImpl(event, syncEngine: syncEngine)
+          }
+        }
+      } catch is CancellationError { }
+      catch { diagnosticFailure(error) }
     }
 
     private func handleEventImpl(_ event: Event, syncEngine: any SyncEngineProtocol) async {
@@ -1037,7 +1129,10 @@
 
       case .willFetchRecordZoneChanges:
         await MainActor.run {
-          fetchingChangesCount += 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            fetchingChangesCount += 1
+          }
         }
       case .didFetchRecordZoneChanges(_, let error):
         if let error {
@@ -1047,27 +1142,44 @@
           }
         }
         await MainActor.run {
-          fetchingChangesCount -= 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            fetchingChangesCount -= 1
+          }
         }
 
       case .willFetchChanges:
         await MainActor.run {
-          fetchingChangesCount += 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            fetchingChangesCount += 1
+          }
         }
       case .didFetchChanges:
+        await recoverLegacyIncomingRecords(engine: syncEngine)
+        await replayIncomingChanges()
         fetchCompletion.withValue { $0.completed[ObjectIdentifier(syncEngine), default: 0] += 1 }
         await MainActor.run {
-          fetchingChangesCount -= 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            fetchingChangesCount -= 1
+          }
         }
 
       case .willSendChanges:
         await MainActor.run {
-          sendingChangesCount += 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            sendingChangesCount += 1
+          }
         }
       case .didSendChanges:
         outgoingAttempts.finish(engine: syncEngine)
         await MainActor.run {
-          sendingChangesCount -= 1
+          startStopLock.withLock {
+            guard (try? SyncWorkContext.token?.check()) != nil else { return }
+            sendingChangesCount -= 1
+          }
         }
 
       @unknown default:
@@ -1089,6 +1201,23 @@
     package func nextRecordZoneChangeBatch(
       reason: CKSyncEngine.SyncReason = .scheduled,
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
+      syncEngine: any SyncEngineProtocol
+    ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      guard acceptsCallback(from: syncEngine) else { return nil }
+      do {
+        return try await withSyncWork {
+          try await requireAccountOwnership()
+          let batch = await preparedBatch(reason: reason, options: options, syncEngine: syncEngine)
+          try await requireAccountOwnership()
+          try SyncWorkContext.token?.check()
+          return batch
+        }
+      } catch is CancellationError { return nil }
+      catch { diagnosticFailure(error); return nil }
+    }
+
+    private func preparedBatch(
+      reason: CKSyncEngine.SyncReason, options: CKSyncEngine.SendChangesOptions,
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
       let key = SyncDiagnosticEmitter.TransferKey(engine: ObjectIdentifier(syncEngine), sending: true)
@@ -1156,7 +1285,9 @@
       #endif
 
       let diagnosticOperation = SyncDiagnosticContext.operation
+      let workToken = SyncWorkContext.token
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
+        await SyncWorkContext.$token.withValue(workToken) {
         await SyncDiagnosticContext.$operation.withValue(diagnosticOperation) {
           guard
             let metadata = await withDiagnosticErrorReporting(
@@ -1248,6 +1379,7 @@
           if record == nil { missingRecord = recordID }
           else { sentRecord = recordID }
           return record
+        }
         }
       }
       let diagnosticCounts = SyncDiagnosticContext.operation?.counts.value ?? [:]
@@ -1379,46 +1511,33 @@
       changeType: CKSyncEngine.Event.AccountChange.ChangeType,
       syncEngine: any SyncEngineProtocol
     ) async {
-      guard syncEngine === syncEngines.private
-      else { return }
-
+      guard acceptsCallback(from: syncEngine) else { return }
       switch changeType {
       case .signIn:
-        syncEngine.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
-        await withDiagnosticErrorReporting {
+        do {
+          try await requireAccountOwnership()
+          guard syncEngine === syncEngines.private else { return }
+          syncEngine.state.add(pendingDatabaseChanges: [.saveZone(defaultZone)])
           try await enqueueUnknownRecordsForCloudKit()
-        }
-        await delegate?.syncEngine(self, accountChanged: changeType)
-      case .signOut, .switchAccounts:
-        guard let delegate
-        else {
-          await withDiagnosticErrorReporting(.sqliteDataCloudKitFailure) {
-            try await deleteLocalData()
-          }
-          return
-        }
-        await delegate.syncEngine(self, accountChanged: changeType)
-
+        } catch { diagnosticFailure(error) }
+      case .signOut:
+        setAccountFailure(.accountUnavailable(.noAccount))
+        stop()
+      case .switchAccounts:
+        setAccountFailure(.differentAccount)
+        stop()
       @unknown default:
-        break
+        stop()
       }
+      // Notification happens after fencing. The delegate must return before the owner awaits
+      // retirement; it must not erase or replace the store from inside this callback.
+      await delegate?.syncEngine(self, accountChanged: changeType)
     }
 
     package func handleStateUpdate(
-      stateSerialization: CKSyncEngine.State.Serialization,
-      syncEngine: any SyncEngineProtocol
+      stateSerialization: CKSyncEngine.State.Serialization, syncEngine: any SyncEngineProtocol
     ) async {
-      await withFetchErrorReporting {
-        try await userDatabase.write { db in
-          try StateSerialization.upsert {
-            StateSerialization.Draft(
-              scope: syncEngine.database.databaseScope,
-              data: stateSerialization
-            )
-          }
-          .execute(db)
-        }
-      }
+      await commitIncomingCheckpoint(stateSerialization, engine: syncEngine)
     }
 
     package func handleFetchedDatabaseChanges(
@@ -1426,87 +1545,8 @@
       deletions: [(zoneID: CKRecordZone.ID, reason: CKDatabase.DatabaseChange.Deletion.Reason)],
       syncEngine: any SyncEngineProtocol
     ) async {
-      let defaultZoneDeleted =
-        await withFetchErrorReporting {
-          try await userDatabase.write { db in
-            var defaultZoneDeleted = false
-            for (zoneID, reason) in deletions {
-              switch reason {
-              case .deleted, .purged:
-                try deleteRecords(in: zoneID, db: db)
-                if zoneID == self.defaultZone.zoneID {
-                  defaultZoneDeleted = true
-                }
-              case .encryptedDataReset:
-                try uploadRecords(in: zoneID, db: db)
-              @unknown default:
-                reportSyncIssue("Unknown deletion reason: \(reason)")
-              }
-            }
-            return defaultZoneDeleted
-          }
-        }
-        ?? false
-      if defaultZoneDeleted {
-        syncEngine.state.add(pendingDatabaseChanges: [.saveZone(self.defaultZone)])
-      }
-      @Sendable
-      func deleteRecords(in zoneID: CKRecordZone.ID, db: Database) throws {
-        let recordTypes = Dictionary(
-          grouping:
-            try SyncMetadata
-            .where { $0.zoneName.eq(zoneID.zoneName) && $0.ownerName.eq(zoneID.ownerName) }
-            .select { ($0.recordType, $0.recordPrimaryKey) }
-            .fetchAll(db),
-          by: \.0
-        )
-        .mapValues {
-          $0.map(\.1)
-        }
-        for (recordType, primaryKeys) in recordTypes {
-          guard let table = tablesByName[recordType]
-          else { continue }
-          func open<T: PrimaryKeyedTable>(_: some SynchronizableTable<T>) {
-            withFetchErrorReporting {
-              try T.unscoped.where { #sql("\($0.primaryKey)").in(primaryKeys) }.delete().execute(db)
-            }
-          }
-          open(table)
-        }
-      }
-      @Sendable
-      func uploadRecords(in zoneID: CKRecordZone.ID, db: Database) throws {
-        let recordTypes = Set(
-          try SyncMetadata
-            .where(\.hasLastKnownServerRecord)
-            .select(\.lastKnownServerRecord)
-            .fetchAll(db)
-            .compactMap { $0?.recordID.zoneID == zoneID ? $0?.recordType : nil }
-        )
-        var pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
-        for recordType in recordTypes {
-          guard let table = tablesByName[recordType]
-          else { continue }
-          func open<T>(_: some SynchronizableTable<T>) {
-            withFetchErrorReporting {
-              pendingRecordZoneChanges.append(
-                contentsOf: try T.unscoped.select(\._recordName).fetchAll(db).map {
-                  .saveRecord(CKRecord.ID(recordName: $0, zoneID: zoneID))
-                }
-              )
-            }
-          }
-          open(table)
-        }
-        // Recovery-generated uploads need the same durable ownership as user writes.
-        // Rows from another zone have no matching metadata and were already skipped by encoding.
-        for case .saveRecord(let id) in pendingRecordZoneChanges {
-          if try SyncMetadata.find(id).fetchOne(db) != nil {
-            try OutgoingIntent.adopt(.saveRecord(id), db: db)
-          }
-        }
-        syncEngine.state.add(pendingRecordZoneChanges: pendingRecordZoneChanges)
-      }
+      await captureIncomingZones(deletions: deletions, engine: syncEngine)
+      if let mock = syncEngine as? MockSyncEngine { await commitMockIncomingCheckpoint(mock) }
     }
 
     package func handleFetchedRecordZoneChanges(
@@ -1514,164 +1554,9 @@
       deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)] = [],
       syncEngine: any SyncEngineProtocol
     ) async {
-      let deletedRecordIDsByRecordType = OrderedDictionary(
-        grouping: deletions.sorted { lhs, rhs in
-          topologicallyAscending(
-            lhsTableName: lhs.recordType,
-            rhsTableName: rhs.recordType,
-            rootFirst: false
-          )
-        },
-        by: \.recordType
-      )
-      .mapValues { $0.map(\.recordID) }
-      for (recordType, recordIDs) in deletedRecordIDsByRecordType {
-        if let table = tablesByName[recordType] {
-          func open<T>(_: some SynchronizableTable<T>) async {
-            await withFetchErrorReporting {
-              try await userDatabase.write { db in
-                try T
-                  .unscoped
-                  .where {
-                    #sql("\($0.primaryKey)").in(
-                      SyncMetadata.findAll(recordIDs)
-                        .select(\.recordPrimaryKey)
-                    )
-                  }
-                  .delete()
-                  .execute(db)
-
-                try UnsyncedRecordID
-                  .findAll(recordIDs)
-                  .delete()
-                  .execute(db)
-              }
-            }
-          }
-          await open(table)
-        } else if recordType == CKRecord.SystemType.share {
-          for shareRecordID in recordIDs {
-            await withFetchErrorReporting {
-              try await deleteShare(shareRecordID: shareRecordID)
-            }
-          }
-        } else {
-          SyncDiagnosticContext.operation?.increment("ignored", by: recordIDs.count)
-          // NB: Deleting a record from a table we do not currently recognize.
-          await withFetchErrorReporting {
-            try await userDatabase.write { db in
-              try SyncMetadata
-                .findAll(recordIDs)
-                .delete()
-                .execute(db)
-            }
-          }
-        }
-      }
-
-      let unsyncedRecords =
-        await withFetchErrorReporting {
-          var unsyncedRecordIDs = try await userDatabase.write { db in
-            Set(
-              try UnsyncedRecordID.all
-                .fetchAll(db)
-                .map(CKRecord.ID.init(unsyncedRecordID:))
-            )
-          }
-          let modificationRecordIDs = Set(modifications.map(\.recordID))
-          let unsyncedRecordIDsToDelete = modificationRecordIDs.intersection(unsyncedRecordIDs)
-          unsyncedRecordIDs.subtract(modificationRecordIDs)
-          if !unsyncedRecordIDsToDelete.isEmpty {
-            try await userDatabase.write { db in
-              try UnsyncedRecordID
-                .findAll(unsyncedRecordIDsToDelete)
-                .delete()
-                .execute(db)
-            }
-          }
-          let batchSize = 150
-          let orderedUnsyncedRecordIDs = unsyncedRecordIDs.sorted {
-            topologicallyAscending(
-              lhsTableName: $0.tableName,
-              rhsTableName: $1.tableName,
-              rootFirst: true
-            )
-          }
-          var unsyncedRecords: [CKRecord] = []
-          for start in stride(from: 0, to: orderedUnsyncedRecordIDs.count, by: batchSize) {
-            let recordIDsBatch =
-              orderedUnsyncedRecordIDs
-              .dropFirst(start)
-              .prefix(batchSize)
-            let results = try await syncEngine.database.records(for: Array(recordIDsBatch))
-            for (recordID, result) in results {
-              switch result {
-              case .success(let record):
-                unsyncedRecords.append(record)
-              case .failure(let error as CKError) where error.code == .unknownItem:
-                try await userDatabase.write { db in
-                  try UnsyncedRecordID.find(recordID).delete().execute(db)
-                }
-              case .failure(let error):
-                throw error
-              }
-            }
-          }
-          return unsyncedRecords
-        }
-        ?? [CKRecord]()
-
-      let modifications = (modifications + unsyncedRecords).sorted { lhs, rhs in
-        topologicallyAscending(
-          lhsTableName: lhs.recordType,
-          rhsTableName: rhs.recordType,
-          rootFirst: true
-        )
-      }
-
-      enum ShareOrReference {
-        case share(CKShare)
-        case reference(CKShare.Reference)
-      }
-      let shares: [ShareOrReference] =
-        await withFetchErrorReporting {
-          try await userDatabase.write { db in
-            var shares: [ShareOrReference] = []
-            for record in modifications {
-              if let share = record as? CKShare {
-                shares.append(.share(share))
-              } else {
-                upsertFromServerRecord(record, db: db)
-                if let shareReference = record.share {
-                  shares.append(.reference(shareReference))
-                }
-              }
-            }
-            return shares
-          }
-        }
-        ?? []
-
-      await withTaskGroup(of: Void.self) { group in
-        for share in shares {
-          group.addTask {
-            switch share {
-            case .share(let share):
-              await self.withFetchErrorReporting {
-                try await self.cacheShare(share)
-              }
-            case .reference(let shareReference):
-              await self.withFetchErrorReporting {
-                let record = try await syncEngine.database.record(for: shareReference.recordID)
-                guard let share = record as? CKShare else {
-                  throw FetchCompletionError.invalidRecord(record.recordID)
-                }
-                try await self.cacheShare(share)
-              }
-            }
-          }
-        }
-      }
+      await captureIncoming(modifications: modifications, deletions: deletions, engine: syncEngine)
+      if let mock = syncEngine as? MockSyncEngine { await commitMockIncomingCheckpoint(mock) }
+      await recoverLegacyIncomingRecords(engine: syncEngine)
     }
 
     private func topologicallyAscending(
@@ -1927,6 +1812,13 @@
     }
 
     func deleteShare(shareRecordID: CKRecord.ID) async throws {
+      try await withSyncWork {
+        try await requireAccountOwnership()
+        try await deleteOwnedShare(shareRecordID: shareRecordID)
+      }
+    }
+
+    private func deleteOwnedShare(shareRecordID: CKRecord.ID) async throws {
       let shareAndRecordNameAndZone = try await metadatabase.read { db in
         try SyncMetadata
           .where(\.isShared)
@@ -1941,6 +1833,7 @@
         zoneID: CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
       )
       let rootRecord = try await container.privateCloudDatabase.record(for: rootRecordID)
+      try await requireAccountOwnership()
       try await userDatabase.write { db in
         try SyncMetadata
           .find(
@@ -1963,6 +1856,7 @@
       failureGuard: OutgoingFailureGuard? = nil
     ) async {
       await withFetchErrorReporting {
+        try await requireAccountOwnership()
         try await userDatabase.write { db in
           guard try failureGuard?.allowsRecovery(db) != false else { return }
           upsertFromServerRecord(serverRecord, force: force, db: db)
@@ -1970,7 +1864,7 @@
       }
     }
 
-    private func upsertFromServerRecord(
+    func upsertFromServerRecord(
       _ serverRecord: CKRecord,
       force: Bool = false,
       db: Database
@@ -1983,8 +1877,13 @@
           if tablesByName[serverRecord.recordType] != nil {
             diagnosticFailure(FetchCompletionError.invalidRecord(serverRecord.recordID))
             // Preserve ordinary fetch's ignored-record behavior, but not checked success.
-            fetchCompletion.withValue {
-              $0.localFailure = $0.localFailure ?? FetchCompletionError.invalidRecord(serverRecord.recordID)
+            let error = FetchCompletionError.invalidRecord(serverRecord.recordID)
+            if let failure = IncomingApplyContext.failure { failure.withValue { $0 = $0 ?? error } }
+            else {
+              fetchCompletion.withValue {
+                $0.localFailure = $0.localFailure ?? error
+                $0.untrackedLocalFailure = $0.untrackedLocalFailure ?? error
+              }
             }
           } else {
             SyncDiagnosticContext.operation?.increment("ignored")
@@ -2094,6 +1993,7 @@
       }
       if recordHasAsset {
         record = try await container.database(for: record.recordID).record(for: record.recordID)
+        try await requireAccountOwnership()
       }
 
       var query: QueryFragment = "INSERT INTO \(T.self) ("

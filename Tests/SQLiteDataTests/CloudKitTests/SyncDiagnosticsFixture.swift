@@ -11,7 +11,9 @@
     let engine: SyncEngine
     let events = LockIsolated<[SyncDiagnostic]>([])
 
-    init(minimumLevel: SyncDiagnostic.Level = .debug) throws {
+    init(minimumLevel: SyncDiagnostic.Level = .debug,
+         receive: (@Sendable (SyncDiagnostic) -> Void)? = nil,
+         accountIsolation: SyncAccountIsolation? = nil) throws {
       let database = try SQLiteDataTests.database(
         containerIdentifier: "diagnostics.\(UUID())", attachMetadatabase: false
       )
@@ -24,7 +26,8 @@
           startImmediately: false, logger: Logger(.disabled),
           diagnostics: SyncDiagnostics(minimumLevel: minimumLevel) { event in
             events.withValue { $0.append(event) }
-          }
+            receive?(event)
+          }, accountIsolation: accountIsolation
         )
       }
     }

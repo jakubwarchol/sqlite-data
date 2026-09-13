@@ -1,5 +1,9 @@
 # L1: durable outgoing intent
 
+Current L2–L4 behavior and migration are described in
+[Sync recovery and account isolation](Sync-recovery-and-account-isolation.md).
+The original patch's verification record below is retained.
+
 This patch makes pending local changes durable independently of CKSyncEngine's
 serialized scheduling state. It builds on the checked-fetch and L8 diagnostics
 patches. No new public acknowledgement API or CloudKit record fields are added.

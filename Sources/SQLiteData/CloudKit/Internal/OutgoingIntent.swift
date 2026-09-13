@@ -53,12 +53,15 @@
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL,
           containerIdentifier TEXT NOT NULL
         ) STRICT;
-        INSERT OR IGNORE INTO main.sqlitedata_icloud_outgoingConfiguration VALUES (1, 1, ?)
+        INSERT OR IGNORE INTO main.sqlitedata_icloud_outgoingConfiguration VALUES (1, 2, ?)
         """, arguments: [containerIdentifier ?? ""])
       let config = try Row.fetchOne(db, sql: "SELECT * FROM main.sqlitedata_icloud_outgoingConfiguration")!
-      guard config["version"] as Int == 1, config["containerIdentifier"] as String == (containerIdentifier ?? "") else {
+      guard [1, 2].contains(config["version"] as Int), config["containerIdentifier"] as String == (containerIdentifier ?? "") else {
         throw ConfigurationMismatch()
       }
+      // Version two also owns authoritative incoming checkpoints and optional account binding.
+      // L1-only clients reject it instead of reopening with a stale sidecar checkpoint.
+      try db.execute(sql: "UPDATE main.sqlitedata_icloud_outgoingConfiguration SET version = 2 WHERE singleton = 1")
       try db.execute(sql: """
         CREATE TABLE IF NOT EXISTS main.\(table) (
           recordName TEXT NOT NULL, zoneName TEXT NOT NULL, ownerName TEXT NOT NULL,

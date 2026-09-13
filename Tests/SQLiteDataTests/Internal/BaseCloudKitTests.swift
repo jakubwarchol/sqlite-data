@@ -101,13 +101,14 @@
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     func signOut() async {
       container._accountStatus.withValue { $0 = .noAccount }
+      let privateEngine = syncEngine.private, sharedEngine = syncEngine.shared
       await syncEngine.handleEvent(
         .accountChange(changeType: .signOut(previousUser: previousUserRecordID)),
-        syncEngine: syncEngine.private
+        syncEngine: privateEngine
       )
       await syncEngine.handleEvent(
         .accountChange(changeType: .signOut(previousUser: previousUserRecordID)),
-        syncEngine: syncEngine.shared
+        syncEngine: sharedEngine
       )
     }
 
@@ -119,6 +120,10 @@
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     func signIn() async {
       container._accountStatus.withValue { $0 = .available }
+      // The resource owner explicitly resumes after the prior session has drained.
+      if !syncEngine.isRunning {
+        do { try await syncEngine.start() } catch { Issue.record(error); return }
+      }
       // NB: Emulates what CKSyncEngine does when signing in
       syncEngine.private.state.removePendingChanges()
       syncEngine.shared.state.removePendingChanges()

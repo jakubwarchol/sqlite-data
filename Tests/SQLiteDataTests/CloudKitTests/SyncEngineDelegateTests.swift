@@ -176,48 +176,18 @@
       }
 
       @Test(.taskLocal($syncEngineDelegate, DefaultImplementationDelegate()))
-      func accountChanged_DefaultImplementation() async throws {
+      func accountChanged_DefaultImplementationRetainsData() async throws {
         try await userDatabase.userWrite { db in
-          try db.seed {
-            RemindersList(id: 1, title: "Personal")
-          }
+          try db.seed { RemindersList(id: 1, title: "Personal") }
         }
         try await syncEngine.processPendingRecordZoneChanges(scope: .private)
-
         await signOut()
-
-        assertQuery(RemindersList.all, database: userDatabase.database) {
-          """
-          (No results)
-          """
+        #expect(!syncEngine.isRunning)
+        try await userDatabase.read { db in
+          try #expect(RemindersList.find(1).fetchOne(db)?.title == "Personal")
         }
-        assertQuery(SyncMetadata.all, database: syncEngine.metadatabase) {
-          """
-          (No results)
-          """
-        }
-        assertInlineSnapshot(of: container, as: .customDump) {
-          """
-          MockCloudContainer(
-            privateCloudDatabase: MockCloudDatabase(
-              databaseScope: .private,
-              storage: [
-                [0]: CKRecord(
-                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
-                  recordType: "remindersLists",
-                  parent: nil,
-                  share: nil,
-                  id: 1,
-                  title: "Personal"
-                )
-              ]
-            ),
-            sharedCloudDatabase: MockCloudDatabase(
-              databaseScope: .shared,
-              storage: []
-            )
-          )
-          """
+        try await syncEngine.metadatabase.read { db in
+          try #expect(SyncMetadata.count().fetchOne(db) == 1)
         }
       }
     }
